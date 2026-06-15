@@ -82,6 +82,14 @@ pub fn should_fund(free_balance: u128, target_amount: u128) -> bool {
     free_balance < target_amount
 }
 
+/// Amount needed to bring `free_balance` up to `target_amount`.
+/// Returns `None` when no funding is needed.
+pub fn funding_shortfall(free_balance: u128, target_amount: u128) -> Option<u128> {
+    target_amount
+        .checked_sub(free_balance)
+        .filter(|amount| *amount > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,7 +108,12 @@ mod tests {
     fn account_from_hex_tail_extracts_trailing_32_bytes() {
         let account = [0xabu8; 32];
         // prefix(32) ++ hasher(16) ++ account(32) — a realistic Blake2_128Concat key.
-        let key = format!("0x{}{}{}", "11".repeat(32), "22".repeat(16), hex::encode(account));
+        let key = format!(
+            "0x{}{}{}",
+            "11".repeat(32),
+            "22".repeat(16),
+            hex::encode(account)
+        );
         assert_eq!(account_from_hex_tail(&key), Some(account));
     }
 
@@ -129,6 +142,15 @@ mod tests {
         assert!(should_fund(99, 100));
         assert!(!should_fund(100, 100));
         assert!(!should_fund(101, 100));
+    }
+
+    #[test]
+    fn funding_shortfall_only_returns_amount_needed_to_reach_target() {
+        assert_eq!(funding_shortfall(0, 100), Some(100));
+        assert_eq!(funding_shortfall(40, 100), Some(60));
+        assert_eq!(funding_shortfall(99, 100), Some(1));
+        assert_eq!(funding_shortfall(100, 100), None);
+        assert_eq!(funding_shortfall(101, 100), None);
     }
 
     #[test]

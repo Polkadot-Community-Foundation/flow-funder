@@ -25,7 +25,7 @@ use subxt_signer::sr25519::Keypair;
 use tracing::{error, info, warn};
 
 use crate::people::NewRegistration;
-use crate::registration::{free_balance_from_account_info, should_fund};
+use crate::registration::{free_balance_from_account_info, funding_shortfall, should_fund};
 
 // ---------------------------------------------------------------------------
 // Extension macros (mirrors mission-control's flow-attester/chain.rs)
@@ -314,8 +314,7 @@ impl Funder {
     }
 
     /// Fund one registration: skip if already at/above target, else submit a
-    /// `transfer_keep_alive` of the shortfall-to-target… actually the full
-    /// target amount (simpler and the account is empty by construction).
+    /// `transfer_keep_alive` for the shortfall to the target.
     pub async fn fund(
         &mut self,
         registration: &NewRegistration,
@@ -327,27 +326,26 @@ impl Funder {
             return Ok(FundOutcome::Skipped { free });
         }
 
-        let tx_hash = self.submit_transfer(account).await?;
+        let amount = funding_shortfall(free, self.target_amount)
+            .ok_or("account unexpectedly has no funding shortfall")?;
+        let tx_hash = self.submit_transfer(account, amount).await?;
         Ok(FundOutcome::Funded {
             tx_hash,
             free_before: free,
         })
     }
 
-    /// Submit `Balances.transfer_keep_alive(dest, target_amount)`, waiting for
-    /// best-block inclusion, with nonce caching + bounded retry on the pool's
+    /// Submit `Balances.transfer_keep_alive(dest, amount)`, waiting for
+    /// finalized inclusion, with nonce caching + bounded retry on the pool's
     /// transient rejections (mirrors flow-attester's submission loop).
     async fn submit_transfer(
         &mut self,
         account: &AccountId32,
+        transfer_amount: u128,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let dest = Value::unnamed_variant("Id", [Value::from_bytes(account.0)]);
-        let amount = Value::u128(self.target_amount);
-        let payload = subxt::dynamic::tx(
-            "Balances",
-            "transfer_keep_alive",
-            vec![dest, amount],
-        );
+        let amount = Value::u128(transfer_amount);
+        let payload = subxt::dynamic::tx("Balances", "transfer_keep_alive", vec![dest, amount]);
 
         let mut last_err: Option<String> = None;
 
@@ -363,7 +361,7 @@ impl Funder {
                 }
             };
 
-            info!(account = %account, attempt, nonce, "submitting transfer_keep_alive");
+            info!(account = %account, attempt, nonce, transfer_amount, "submitting transfer_keep_alive");
 
             let progress = match tx_client
                 .sign_and_submit_then_watch(&payload, &self.signer, build_params(nonce))
@@ -385,11 +383,11 @@ impl Funder {
 
             let tx_hash = format!("{:?}", progress.extrinsic_hash());
 
-            match wait_for_in_block(progress).await {
+            match wait_for_finalized(progress).await {
                 Ok(in_block) => match in_block.wait_for_success().await {
                     Ok(_events) => {
                         self.next_nonce = Some(nonce + 1);
-                        info!(account = %account, tx_hash = %tx_hash, "transfer included in best block");
+                        info!(account = %account, tx_hash = %tx_hash, "transfer finalized");
                         return Ok(tx_hash);
                     }
                     Err(e) => {
@@ -408,12 +406,12 @@ impl Funder {
                 Err(e) => {
                     if is_retriable(&e) && attempt < self.max_retries {
                         self.next_nonce = None;
-                        warn!(account = %account, attempt, error = %e, "tx dropped before inclusion — retrying");
+                        warn!(account = %account, attempt, error = %e, "tx dropped before finalization — retrying");
                         last_err = Some(e);
                         backoff(attempt).await;
                         continue;
                     }
-                    return Err(format!("inclusion wait failed: {e}").into());
+                    return Err(format!("finalization wait failed: {e}").into());
                 }
             }
         }
@@ -424,9 +422,9 @@ impl Funder {
     }
 }
 
-/// Drain the status stream and return the first in-block status (best or
-/// finalized). subxt 0.50 has no `wait_for_in_block` helper.
-async fn wait_for_in_block<C>(
+/// Drain the status stream and return the finalized status. A best-block
+/// inclusion is not durable enough to advance the People cursor.
+async fn wait_for_finalized<C>(
     mut progress: TransactionProgress<AssetHubConfig, C>,
 ) -> Result<TransactionInBlock<AssetHubConfig, C>, String>
 where
@@ -435,15 +433,15 @@ where
     while let Some(status) = progress.next().await {
         let status = status.map_err(|e: subxt::error::TransactionProgressError| e.to_string())?;
         match status {
-            TransactionStatus::InBestBlock(in_block)
-            | TransactionStatus::InFinalizedBlock(in_block) => return Ok(in_block),
+            TransactionStatus::InFinalizedBlock(in_block) => return Ok(in_block),
+            TransactionStatus::NoLongerInBestBlock => continue,
             TransactionStatus::Error { message } => return Err(format!("stream error: {message}")),
             TransactionStatus::Invalid { message } => return Err(format!("invalid: {message}")),
             TransactionStatus::Dropped { message } => return Err(format!("dropped: {message}")),
             _ => continue,
         }
     }
-    Err("tx progress stream ended before block inclusion".into())
+    Err("tx progress stream ended before finalization".into())
 }
 
 fn is_retriable(err: &str) -> bool {

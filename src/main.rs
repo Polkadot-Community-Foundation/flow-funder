@@ -69,7 +69,7 @@ struct Cli {
     )]
     asset_hub_url: String,
 
-    /// Sr25519 seed phrase for the funding account. Defaults to the dev mnemonic.
+    /// Sr25519 seed phrase for the funding account. Required unless --dry-run is set.
     #[arg(long, env = "FUNDER_SEED_PHRASE")]
     seed_phrase: Option<String>,
 
@@ -77,7 +77,7 @@ struct Cli {
     #[arg(long, env = "FUNDER_DERIVATION_PATH")]
     derivation_path: Option<String>,
 
-    /// Amount to transfer per newly-registered account, in plancks.
+    /// Target free balance for each newly-registered account, in plancks.
     /// Paseo's native token (PAS) has 10 decimals, so 10_000_000_000 = 1 PAS.
     #[arg(long, env = "FUNDER_AMOUNT_PLANCK", default_value = "10000000000")]
     amount: u128,
@@ -87,7 +87,11 @@ struct Cli {
     max_submit_retries: u32,
 
     /// File holding the resume cursor (last fully-handled People block hash).
-    #[arg(long, env = "FUNDER_CURSOR_FILE", default_value = "flow-funder-cursor.txt")]
+    #[arg(
+        long,
+        env = "FUNDER_CURSOR_FILE",
+        default_value = "flow-funder-cursor.txt"
+    )]
     cursor_file: String,
 
     /// Detect and log registrations but never submit a transfer (or persist a
@@ -180,7 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .expect("failed to bind health port");
         info!(port = health_port, "health endpoint listening");
-        axum::serve(listener, app).await.expect("health server failed");
+        axum::serve(listener, app)
+            .await
+            .expect("health server failed");
     });
 
     let signer = build_signer(&cli)?;
@@ -283,24 +289,10 @@ async fn run_people_cycle(
         let block = block_result?;
         let block_number = block.number();
         let block_hash = block.hash();
-        let parent_hash = block.header().parent_hash;
         *state.last_block_at.write().await = Some(unix_timestamp_now());
 
         let added = match diff_added_accounts(&rpc, block_hash, prev_block_hash).await {
             Ok(accounts) => accounts,
-            // A diff against the cached prev can fail across a reorg. Retry once
-            // against the real parent; if that also fails, skip WITHOUT advancing
-            // the cursor so the next block's diff re-covers this range.
-            Err(e) if prev_block_hash != parent_hash => {
-                warn!(block = block_number, error = %e, "storageDiff failed against cached prev — retrying against parent (possible reorg)");
-                match diff_added_accounts(&rpc, block_hash, parent_hash).await {
-                    Ok(accounts) => accounts,
-                    Err(e2) => {
-                        warn!(block = block_number, error = %e2, "storageDiff retry failed — leaving cursor pinned");
-                        continue;
-                    }
-                }
-            }
             Err(e) => {
                 warn!(block = block_number, error = %e, "storageDiff failed — leaving cursor pinned");
                 continue;
@@ -366,13 +358,18 @@ async fn handle_registration(
                 would_fund = free < cli.amount,
                 "dry-run — not submitting"
             ),
-            Err(e) => warn!(account = %registration.account, error = %e, "dry-run balance query failed"),
+            Err(e) => {
+                warn!(account = %registration.account, error = %e, "dry-run balance query failed")
+            }
         }
         return true;
     }
 
     match funder.fund(registration).await {
-        Ok(FundOutcome::Funded { tx_hash, free_before }) => {
+        Ok(FundOutcome::Funded {
+            tx_hash,
+            free_before,
+        }) => {
             state.accounts_funded.fetch_add(1, Ordering::Relaxed);
             info!(
                 account = %registration.account,
@@ -409,10 +406,15 @@ async fn handle_registration(
 // ---------------------------------------------------------------------------
 
 fn build_signer(cli: &Cli) -> Result<Keypair, Box<dyn std::error::Error>> {
-    let seed_phrase = cli
-        .seed_phrase
-        .as_deref()
-        .unwrap_or("bottom drive obey lake curtain smoke basket hold race lonely fit walk");
+    let seed_phrase = match cli.seed_phrase.as_deref() {
+        Some(seed_phrase) => seed_phrase,
+        None if cli.dry_run => {
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk"
+        }
+        None => {
+            return Err("FUNDER_SEED_PHRASE or --seed-phrase is required for live funding".into());
+        }
+    };
     let derivation_path = cli
         .derivation_path
         .as_deref()
@@ -421,9 +423,41 @@ fn build_signer(cli: &Cli) -> Result<Keypair, Box<dyn std::error::Error>> {
         .unwrap_or("//Alice");
 
     let suri = format!("{seed_phrase}{derivation_path}");
-    let uri: SecretUri = suri.parse().map_err(|e| format!("invalid secret URI: {e}"))?;
+    let uri: SecretUri = suri
+        .parse()
+        .map_err(|e| format!("invalid secret URI: {e}"))?;
     let keypair = Keypair::from_uri(&uri).map_err(|e| format!("invalid seed phrase: {e}"))?;
     Ok(keypair)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_for_signer(dry_run: bool, seed_phrase: Option<&str>) -> Cli {
+        Cli {
+            people_url: "ws://people".to_string(),
+            asset_hub_url: "ws://asset-hub".to_string(),
+            seed_phrase: seed_phrase.map(str::to_string),
+            derivation_path: None,
+            amount: 100,
+            max_submit_retries: 3,
+            cursor_file: "cursor.txt".to_string(),
+            dry_run,
+            health_port: 3033,
+        }
+    }
+
+    #[test]
+    fn build_signer_requires_explicit_seed_for_live_funding() {
+        let err = build_signer(&cli_for_signer(false, None)).unwrap_err();
+        assert!(err.to_string().contains("required for live funding"));
+    }
+
+    #[test]
+    fn build_signer_allows_dev_seed_for_dry_run() {
+        assert!(build_signer(&cli_for_signer(true, None)).is_ok());
+    }
 }
 
 fn unix_timestamp_now() -> String {

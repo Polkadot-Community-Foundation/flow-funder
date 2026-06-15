@@ -88,7 +88,10 @@ mod tests {
     #[tokio::test]
     async fn save_then_load_roundtrips() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("flow-funder-cursor-test-{}.txt", std::process::id()));
+        let path = dir.join(format!(
+            "flow-funder-cursor-test-{}.txt",
+            std::process::id()
+        ));
         let store = CursorStore::new(&path);
 
         assert!(store.load().await.unwrap().is_none(), "absent file → None");

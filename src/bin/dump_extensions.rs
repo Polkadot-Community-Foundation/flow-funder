@@ -75,12 +75,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extrinsic = metadata.extrinsic();
 
     println!("# {url}");
-    println!("supported extrinsic versions: {:?}", extrinsic.supported_versions());
+    println!(
+        "supported extrinsic versions: {:?}",
+        extrinsic.supported_versions()
+    );
     println!(
         "tx-extension encoding version: {}",
         extrinsic.transaction_extension_version_to_use_for_encoding()
     );
-    for (i, ext) in extrinsic.transaction_extensions_to_use_for_encoding().enumerate() {
+    for (i, ext) in extrinsic
+        .transaction_extensions_to_use_for_encoding()
+        .enumerate()
+    {
         println!(
             "{i:2}: {:<24} extra: {}",
             ext.identifier(),

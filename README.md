@@ -23,7 +23,7 @@ finalized block N ──┐
                                     free < target?
                                        │ yes
                                        ▼
-                              Balances.transfer_keep_alive(account, amount)
+                              Balances.transfer_keep_alive(account, target - free)
 ```
 
 1. **Detect.** Subscribe to finalized People-chain blocks. For each block, run
@@ -34,8 +34,8 @@ finalized block N ──┐
    `System.Account`. The People-chain and Asset Hub share the same `AccountId32`,
    so no address translation is needed.
 3. **Fund.** If the balance is below the target, submit
-   `Balances.transfer_keep_alive(dest, amount)` from the funding account, waiting
-   for best-block inclusion with bounded retry on transient pool rejections.
+   `Balances.transfer_keep_alive(dest, target - free)` from the funding account, waiting
+   for finalized inclusion with bounded retry on transient pool rejections.
 
 The balance check is what makes the bot **idempotent**: an account already at or
 above the target is skipped, so re-observing it or restarting the bot never
@@ -74,7 +74,7 @@ cargo build --release
 # Dry run — detect + log, never submit (recommended first):
 cargo run --release --bin flow-funder -- --dry-run
 
-# Live, with an explicit funding key and amount:
+# Live, with an explicit funding key and target balance:
 FUNDER_SEED_PHRASE="…twelve words…" \
 FUNDER_DERIVATION_PATH=//funder \
 FUNDER_AMOUNT_PLANCK=10000000000 \
@@ -82,8 +82,8 @@ cargo run --release --bin flow-funder
 ```
 
 All flags have `--long` and env-var forms — see `.env.example` or `--help`.
-Defaults target **Paseo people-next** and **Paseo Asset Hub next**, signing with
-the dev `//Alice` key (override `FUNDER_SEED_PHRASE` for anything real).
+Defaults target **Paseo people-next** and **Paseo Asset Hub next**. Live
+runs require `FUNDER_SEED_PHRASE`; dry runs may use the dev `//Alice` key.
 
 A health endpoint is served at `GET http://localhost:3033/health` reporting
 connection state, registrations seen, accounts funded/skipped, and failures.
@@ -94,9 +94,9 @@ connection state, registrations seen, accounts funded/skipped, and failures.
 | --- | --- | --- | --- |
 | `PEOPLE_NODE_URL` | `--people-url` | `wss://paseo-people-next-system-rpc.polkadot.io` | People chain WS (needs archive RPC) |
 | `ASSET_HUB_NODE_URL` | `--asset-hub-url` | `wss://paseo-asset-hub-next-rpc.polkadot.io` | Asset Hub WS |
-| `FUNDER_SEED_PHRASE` | `--seed-phrase` | dev mnemonic | Funding account mnemonic |
+| `FUNDER_SEED_PHRASE` | `--seed-phrase` | required live | Funding account mnemonic |
 | `FUNDER_DERIVATION_PATH` | `--derivation-path` | `//Alice` | Path appended to the seed |
-| `FUNDER_AMOUNT_PLANCK` | `--amount` | `10000000000` (1 PAS) | Transfer per account, in plancks |
+| `FUNDER_AMOUNT_PLANCK` | `--amount` | `10000000000` (1 PAS) | Target free balance per account, in plancks |
 | `FUNDER_MAX_SUBMIT_RETRIES` | `--max-submit-retries` | `3` | Retries on transient pool errors |
 | `FUNDER_CURSOR_FILE` | `--cursor-file` | `flow-funder-cursor.txt` | Resume cursor (last fully-handled block) |
 | `FUNDER_DRY_RUN` | `--dry-run` | `false` | Detect/log only, never submit or persist |
