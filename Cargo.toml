@@ -1,0 +1,36 @@
+[package]
+name = "flow-funder"
+version = "0.1.0"
+edition = "2021"
+description = "Watches the People chain for newly-registered lite identities and funds them with native tokens on Asset Hub."
+
+[[bin]]
+name = "flow-funder"
+path = "src/main.rs"
+
+# Dev helper: dumps a chain's transaction-extension order so AssetHubConfig can
+# be pinned to live metadata instead of guessed. Run:
+#   cargo run --bin dump-extensions -- wss://paseo-asset-hub-next-rpc.polkadot.io
+[[bin]]
+name = "dump-extensions"
+path = "src/bin/dump_extensions.rs"
+
+[dependencies]
+subxt = "0.50"
+subxt-rpcs = "0.50"
+subxt-signer = { version = "0.50", features = ["sr25519"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+codec = { package = "parity-scale-codec", version = "3", features = ["derive"] }
+frame-decode = "0.17"
+scale-info = { version = "2.11", features = ["default"] }
+twox-hash = "1.6"
+axum = "0.8"
+
+[dev-dependencies]
