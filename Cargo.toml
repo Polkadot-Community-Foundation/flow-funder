@@ -31,6 +31,7 @@ codec = { package = "parity-scale-codec", version = "3", features = ["derive"] }
 frame-decode = "0.17"
 scale-info = { version = "2.11", features = ["default"] }
 twox-hash = "1.6"
+blake2 = "0.10"
 axum = "0.8"
 
 [dev-dependencies]

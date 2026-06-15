@@ -39,6 +39,28 @@ pub fn lite_people_prefix_hex() -> String {
     format!("0x{}", hex::encode(lite_people_prefix()))
 }
 
+/// Substrate `blake2_128` — a 16-byte BLAKE2b digest.
+fn blake2_128(data: &[u8]) -> [u8; 16] {
+    use blake2::digest::consts::U16;
+    use blake2::{Blake2b, Digest};
+    let mut hasher: Blake2b<U16> = Blake2b::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Full storage key for `System.Account(account)`:
+/// `twox_128("System") ++ twox_128("Account") ++ blake2_128(account) ++ account`
+/// (the map uses the `Blake2_128Concat` hasher). Used to read many balances in a
+/// single `state_queryStorageAt` call instead of one fetch per account.
+pub fn system_account_key(account: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
+    key.extend_from_slice(&twox_128(b"System"));
+    key.extend_from_slice(&twox_128(b"Account"));
+    key.extend_from_slice(&blake2_128(account));
+    key.extend_from_slice(account);
+    key
+}
+
 /// Extract the 32-byte AccountId from the tail of a storage-key hex string.
 ///
 /// `LitePeople` is a map; with the `Blake2_128Concat` / `Twox64Concat` hashers
@@ -72,18 +94,12 @@ pub fn free_balance_from_account_info(bytes: &[u8]) -> Option<u128> {
     u128::decode(&mut cursor).ok() // data.free
 }
 
-/// The fund/skip decision: fund only when the account holds strictly less than
-/// the target amount.
+/// Amount needed to bring `free_balance` up to `target_amount`, or `None` when
+/// no funding is needed (already at/above target).
 ///
 /// This is what makes the bot idempotent across restarts and re-observations —
-/// once an account has been funded to (or above) the target, `should_fund`
-/// returns `false`, so re-processing the same account is a no-op.
-pub fn should_fund(free_balance: u128, target_amount: u128) -> bool {
-    free_balance < target_amount
-}
-
-/// Amount needed to bring `free_balance` up to `target_amount`.
-/// Returns `None` when no funding is needed.
+/// once an account has been funded to (or above) the target, this returns
+/// `None`, so re-processing the same account submits nothing.
 pub fn funding_shortfall(free_balance: u128, target_amount: u128) -> Option<u128> {
     target_amount
         .checked_sub(free_balance)
@@ -101,6 +117,24 @@ mod tests {
         assert_eq!(
             lite_people_prefix_hex(),
             "0x276fc15f94f88f19ef554a8ff4374855e2491c72cc063f0098c08930123488ce"
+        );
+    }
+
+    /// Pinned against the canonical `System.Account` key for Alice
+    /// (`0xd435…da27d`). The prefix `26aa394e…71da9` and the
+    /// `blake2_128(account)` segment `de1e86a9…ea59f` are well-known constants,
+    /// so this proves both `twox_128(pallet/item)` and the `Blake2_128Concat`
+    /// hashing are correct.
+    #[test]
+    fn system_account_key_matches_known_alice_key() {
+        let alice = hex::decode("d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d")
+            .unwrap();
+        let account: [u8; 32] = alice.try_into().unwrap();
+        assert_eq!(
+            hex::encode(system_account_key(&account)),
+            "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9\
+             de1e86a9a8c739864cf3cc5ec2bea59f\
+             d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"
         );
     }
 
@@ -134,14 +168,6 @@ mod tests {
     fn account_from_hex_tail_rejects_non_hex_tail() {
         let key = format!("0x{}", "zz".repeat(32));
         assert_eq!(account_from_hex_tail(&key), None);
-    }
-
-    #[test]
-    fn should_fund_only_below_target() {
-        assert!(should_fund(0, 100));
-        assert!(should_fund(99, 100));
-        assert!(!should_fund(100, 100));
-        assert!(!should_fund(101, 100));
     }
 
     #[test]

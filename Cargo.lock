@@ -992,6 +992,7 @@ name = "flow-funder"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake2",
  "clap",
  "frame-decode",
  "hex",
