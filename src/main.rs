@@ -23,8 +23,9 @@
 //!   * a reservation failure leaves the cursor pinned, so the block is re-decoded
 //!     and the failed name retried, while already-reserved names are skipped.
 //!
-//! On first boot (no cursor) the watcher starts from the current finalized head,
-//! so existing registrations are never retroactively reserved.
+//! On first boot (no cursor) the watcher starts from the current finalized head
+//! unless `--start-from-genesis` is set, in which case it walks from block 0 up
+//! to the streamed finalized head.
 
 mod asset_hub;
 mod attest;
@@ -117,6 +118,12 @@ struct Cli {
         default_value = "flow-reserver-cursor.txt"
     )]
     cursor_file: String,
+
+    /// On first boot (no cursor file), process from People-chain block 0 instead
+    /// of starting at the current finalized head. Existing cursors still win; use
+    /// a fresh cursor file to intentionally backfill from genesis.
+    #[arg(long, env = "RESERVER_START_FROM_GENESIS", default_value = "false")]
+    start_from_genesis: bool,
 
     /// Detect and log registrations but never submit a `reserve_name` (or persist
     /// a cursor — a dry run must not advance a real cursor).
@@ -235,11 +242,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind the health endpoint in `main` so a bind failure fails startup loudly,
     // instead of a `.expect` panic silently killing a spawned task.
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.health_bind, cli.health_port))
-        .await
-        .map_err(|e| {
-            format!("failed to bind health endpoint on {}:{}: {e}", cli.health_bind, cli.health_port)
-        })?;
+    let listener =
+        tokio::net::TcpListener::bind(format!("{}:{}", cli.health_bind, cli.health_port))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to bind health endpoint on {}:{}: {e}",
+                    cli.health_bind, cli.health_port
+                )
+            })?;
     info!(bind = %cli.health_bind, port = cli.health_port, "health endpoint listening");
     {
         let health_state = state.clone();
@@ -359,13 +370,20 @@ async fn run_people_cycle(
     let api = OnlineClient::<SubstrateConfig>::from_rpc_client(rpc.clone()).await?;
     *state.people_connected.write().await = true;
 
-    // Resolve the last fully-handled block; only first boot starts at the tip.
+    // Resolve the last fully-handled block. By default first boot starts at the
+    // tip; explicit backfill mode starts from genesis when no cursor exists.
     let mut last_number = match cursor_store.load().await? {
         Some(hash) => {
             let number = api.at_block(hash).await?.block_header().await?.number();
             info!(cursor = %format_args!("{hash:?}"), number, "resuming from persisted cursor");
             *state.cursor_block_hash.write().await = Some(format!("{hash:?}"));
             number
+        }
+        None if cli.start_from_genesis => {
+            let genesis = api.at_block(0u64).await?;
+            let hash = genesis.block_hash();
+            info!(genesis = %format_args!("{hash:?}"), "first boot with --start-from-genesis — starting from block 0");
+            0
         }
         None => {
             let head = finalized_head(&rpc).await?;
@@ -489,7 +507,9 @@ async fn handle_block(
                 encoded_bytes = report.encoded_bytes,
                 "dry-run — reserve_name encodes against live metadata; not submitting"
             ),
-            Err(e) => warn!(block = block_number, error = %e, "dry-run reservation planning failed"),
+            Err(e) => {
+                warn!(block = block_number, error = %e, "dry-run reservation planning failed")
+            }
         }
         return true;
     }
@@ -594,6 +614,7 @@ mod tests {
             batch_size: 50,
             max_submit_retries: 3,
             cursor_file: "cursor.txt".to_string(),
+            start_from_genesis: false,
             dry_run,
             health_port: 3033,
             health_bind: "127.0.0.1".to_string(),

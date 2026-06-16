@@ -240,11 +240,12 @@ mod tests {
     /// the inner call variant), with or without a consumer registration.
     fn attest_call(username: &[u8], chat_key: &[u8], reserved: Option<&[u8]>) -> Value {
         let consumer = some(Value::unnamed_composite([
-            bytes_value(b"sig"),        // signature (ignored)
-            bytes_value(b"account"),    // account (ignored)
-            bytes_value(chat_key),      // identifier_key
-            bytes_value(username),      // username
-            match reserved {            // reserved_username: Option<Username>
+            bytes_value(b"sig"),     // signature (ignored)
+            bytes_value(b"account"), // account (ignored)
+            bytes_value(chat_key),   // identifier_key
+            bytes_value(username),   // username
+            match reserved {
+                // reserved_username: Option<Username>
                 Some(r) => some(bytes_value(r)),
                 None => none(),
             },
@@ -373,6 +374,9 @@ mod tests {
     #[test]
     fn value_to_bytes_unwraps_boundedvec_newtype_nesting() {
         // bytes_value double-wraps to mirror the real BoundedVec/ChatKey decode.
-        assert_eq!(value_to_bytes(&bytes_value(b"alice.11")).as_deref(), Some(&b"alice.11"[..]));
+        assert_eq!(
+            value_to_bytes(&bytes_value(b"alice.11")).as_deref(),
+            Some(&b"alice.11"[..])
+        );
     }
 }
