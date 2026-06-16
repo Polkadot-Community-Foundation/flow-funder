@@ -2,7 +2,7 @@
 name = "flow-funder"
 version = "0.1.0"
 edition = "2021"
-description = "Watches the People chain for newly-registered lite identities and funds them with native tokens on Asset Hub."
+description = "Watches the People chain for newly-registered lite identities and reserves each username as a dotns name on Asset Hub."
 
 [[bin]]
 name = "flow-funder"

@@ -1,29 +1,35 @@
 //! flow-funder — watch the People chain for newly-registered lite identities and
-//! fund each one with native tokens on Asset Hub.
+//! reserve each one's username as a dotns name on Asset Hub.
 //!
-//! Pattern (after mission-control's flow-people + flow-attester):
-//!   * a People-chain watcher runs `archive_v1_storageDiff` over the
-//!     `PeopleLite::LitePeople` prefix per finalized block and collects every
-//!     newly *added* account (`people` module);
-//!   * for each account, the funder checks its Asset Hub balance and submits
-//!     `Balances.transfer_keep_alive` if it's below target (`asset_hub` module).
-//!     The balance check makes the bot idempotent — an account already at/above
-//!     target is skipped, so retries and restarts never double-fund.
+//! Pattern:
+//!   * a People-chain watcher streams finalized blocks and decodes every
+//!     `PeopleLite::attest` call (including those nested in `Utility` batches),
+//!     harvesting the username plus the crypto inputs the identity-backend already
+//!     signed (`attest` module);
+//!   * for each username it submits `DotnsGateway::reserve_name` on Asset Hub,
+//!     signed with the allowance-holding key (`asset_hub` module). This works
+//!     because `reserve_name` and `attest` verify the byte-identical message, so
+//!     the `candidate_signature`/`proof_of_ownership` from `attest` also validate
+//!     `reserve_name` — every input comes straight off-chain.
+//!     A `DotnsGateway::LiteLabelOwner` check makes it idempotent — a name already
+//!     reserved is skipped, so retries and restarts never double-submit.
 //!
-//! Funding is synchronous per block and gated by a persisted cursor
-//! (`cursor` module): a block's cursor advances only once ALL of its accounts
-//! have been handled. So
+//! Reservation is synchronous per block and gated by a persisted cursor
+//! (`cursor` module): a block's cursor advances only once ALL of its names have
+//! been handled. So
 //!   * a connection loss resumes from the cursor (not the finalized head) — no
-//!     registration in the downtime window is missed; and
-//!   * a fund failure leaves the cursor pinned, so the block is re-diffed and the
-//!     failed account retried, while already-funded accounts are skipped.
+//!     registration in the downtime window is missed; the watcher walks every
+//!     block from the cursor up to the streamed head; and
+//!   * a reservation failure leaves the cursor pinned, so the block is re-decoded
+//!     and the failed name retried, while already-reserved names are skipped.
 //!
 //! On first boot (no cursor) the watcher starts from the current finalized head,
-//! so existing accounts are never retroactively funded.
+//! so existing registrations are never retroactively reserved.
 
 mod asset_hub;
+mod attest;
+mod chain;
 mod cursor;
-mod people;
 mod registration;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,7 +39,8 @@ use std::time::Duration;
 use axum::{extract::State, Json, Router};
 use clap::Parser;
 use serde::Serialize;
-use subxt::config::SubstrateConfig;
+use subxt::client::OnlineClientAtBlock;
+use subxt::config::{Header, SubstrateConfig};
 use subxt::utils::{AccountId32, H256};
 use subxt::OnlineClient;
 use subxt_rpcs::RpcClient;
@@ -42,9 +49,10 @@ use subxt_signer::SecretUri;
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 
-use crate::asset_hub::Funder;
+use crate::asset_hub::Reserver;
+use crate::attest::reservations_in_block;
+use crate::chain::finalized_head;
 use crate::cursor::CursorStore;
-use crate::people::{diff_added_accounts, finalized_head};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -61,7 +69,7 @@ struct Cli {
     )]
     people_url: String,
 
-    /// WebSocket URL of the Asset Hub node to fund accounts on.
+    /// WebSocket URL of the Asset Hub node hosting the dotns gateway.
     #[arg(
         long,
         env = "ASSET_HUB_NODE_URL",
@@ -69,55 +77,60 @@ struct Cli {
     )]
     asset_hub_url: String,
 
-    /// Sr25519 seed phrase for the funding account. Required unless --dry-run is set.
-    #[arg(long, env = "FUNDER_SEED_PHRASE")]
+    /// Sr25519 seed phrase for the reserving (signing) account. With proxy
+    /// delegation this is the delegate key. One of --seed-phrase or --secret-key
+    /// is required unless --dry-run is set.
+    #[arg(long, env = "RESERVER_SEED_PHRASE")]
     seed_phrase: Option<String>,
 
-    /// Derivation path appended to the seed (e.g. "//Alice"). Defaults to //Alice.
-    #[arg(long, env = "FUNDER_DERIVATION_PATH")]
+    /// Raw 32-byte sr25519 secret key (hex, with or without 0x) for the signing
+    /// account — the format identity-backend uses (`ATTESTER_PROXY_PRIVATE_KEY`).
+    /// Takes precedence over --seed-phrase. Ignores --derivation-path.
+    #[arg(long, env = "RESERVER_SECRET_KEY")]
+    secret_key: Option<String>,
+
+    /// Derivation path appended to the seed phrase (e.g. "//Alice"). Defaults to
+    /// //Alice. Only applies to --seed-phrase, not --secret-key.
+    #[arg(long, env = "RESERVER_DERIVATION_PATH")]
     derivation_path: Option<String>,
 
-    /// Target free balance for each newly-registered account, in plancks.
-    /// Paseo's native token (PAS) has 10 decimals, so 10_000_000_000 = 1 PAS.
-    #[arg(long, env = "FUNDER_AMOUNT_PLANCK", default_value = "10000000000")]
-    amount: u128,
+    /// SS58 address of the account that holds `AttestationAllowance` on the dotns
+    /// gateway, when the signer is its proxy delegate rather than the holder
+    /// itself. If set, `reserve_name` is submitted wrapped in `Proxy.proxy(real =
+    /// this account, …)`. Omit when the signer holds the allowance directly.
+    #[arg(long, env = "RESERVER_PROXY_FOR")]
+    proxy_for: Option<String>,
 
-    /// Fat-finger guard: reject `--amount` above this many plancks at startup
-    /// (default 100_000 PAS). Raise it deliberately for a high-value funder.
-    #[arg(long, env = "FUNDER_MAX_AMOUNT_PLANCK", default_value = "1000000000000000")]
-    max_amount: u128,
-
-    /// Maximum submission retries per transfer on transient pool rejections.
-    #[arg(long, env = "FUNDER_MAX_SUBMIT_RETRIES", default_value = "3")]
-    max_submit_retries: u32,
-
-    /// Max accounts per `Utility.batch_all` extrinsic. A block's
-    /// needing-funding accounts are funded in chunks of this size (one tx each),
-    /// so catch-up after downtime collapses many transfers into a few txs.
-    #[arg(long, env = "FUNDER_BATCH_SIZE", default_value = "100")]
+    /// Max `reserve_name` calls per `Utility.force_batch` extrinsic (matches
+    /// identity-backend's dotns batch size).
+    #[arg(long, env = "RESERVER_BATCH_SIZE", default_value = "50")]
     batch_size: usize,
+
+    /// Maximum submission retries per batch on transient pool rejections.
+    #[arg(long, env = "RESERVER_MAX_SUBMIT_RETRIES", default_value = "3")]
+    max_submit_retries: u32,
 
     /// File holding the resume cursor (last fully-handled People block hash).
     #[arg(
         long,
-        env = "FUNDER_CURSOR_FILE",
-        default_value = "flow-funder-cursor.txt"
+        env = "RESERVER_CURSOR_FILE",
+        default_value = "flow-reserver-cursor.txt"
     )]
     cursor_file: String,
 
-    /// Detect and log registrations but never submit a transfer (or persist a
-    /// cursor — a dry run must not advance a real cursor).
-    #[arg(long, env = "FUNDER_DRY_RUN", default_value = "false")]
+    /// Detect and log registrations but never submit a `reserve_name` (or persist
+    /// a cursor — a dry run must not advance a real cursor).
+    #[arg(long, env = "RESERVER_DRY_RUN", default_value = "false")]
     dry_run: bool,
 
     /// Port for the health check HTTP server.
-    #[arg(long, env = "FUNDER_HEALTH_PORT", default_value = "3033")]
+    #[arg(long, env = "RESERVER_HEALTH_PORT", default_value = "3033")]
     health_port: u16,
 
     /// Address to bind the health server to. Defaults to localhost; set to
     /// `0.0.0.0` only if `/health` must be reachable off-host (it exposes
     /// operational counters and has no auth).
-    #[arg(long, env = "FUNDER_HEALTH_BIND", default_value = "127.0.0.1")]
+    #[arg(long, env = "RESERVER_HEALTH_BIND", default_value = "127.0.0.1")]
     health_bind: String,
 }
 
@@ -130,9 +143,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Max wait for the next finalized block before treating the People-chain
 /// subscription as dead (a WS that stays open but goes silent).
 const BLOCK_RECV_TIMEOUT: Duration = Duration::from_secs(120);
-/// How often the health gauge refreshes the funding key's balance.
-const BALANCE_GAUGE_INTERVAL: Duration = Duration::from_secs(60);
-/// `fund_failures` at/above this flips `/health` status to `unhealthy`.
+/// `reserve_failures` at/above this flips `/health` status to `unhealthy`.
 const UNHEALTHY_FAILURE_THRESHOLD: u64 = 10;
 
 // ---------------------------------------------------------------------------
@@ -145,11 +156,10 @@ struct AppState {
     asset_hub_connected: Arc<RwLock<bool>>,
     last_block_at: Arc<RwLock<Option<u64>>>,
     cursor_block_hash: Arc<RwLock<Option<String>>>,
-    funding_key_balance: Arc<RwLock<Option<u128>>>,
     registrations_seen: Arc<AtomicU64>,
-    accounts_funded: Arc<AtomicU64>,
-    accounts_skipped: Arc<AtomicU64>,
-    fund_failures: Arc<AtomicU64>,
+    names_reserved: Arc<AtomicU64>,
+    names_skipped: Arc<AtomicU64>,
+    reserve_failures: Arc<AtomicU64>,
     started_at: std::time::Instant,
 }
 
@@ -160,24 +170,23 @@ struct HealthResponse {
     asset_hub_connected: bool,
     last_block_at: Option<u64>,
     cursor_block_hash: Option<String>,
-    funding_key_balance: Option<u128>,
     registrations_seen: u64,
-    accounts_funded: u64,
-    accounts_skipped: u64,
-    fund_failures: u64,
+    names_reserved: u64,
+    names_skipped: u64,
+    reserve_failures: u64,
     uptime_seconds: u64,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let people_connected = *state.people_connected.read().await;
     let asset_hub_connected = *state.asset_hub_connected.read().await;
-    let fund_failures = state.fund_failures.load(Ordering::Relaxed);
+    let reserve_failures = state.reserve_failures.load(Ordering::Relaxed);
 
     // Dynamic status: a hardcoded "ok" while disconnected or failing is useless
     // to an operator/agent watching the endpoint.
-    let status = if fund_failures >= UNHEALTHY_FAILURE_THRESHOLD {
+    let status = if reserve_failures >= UNHEALTHY_FAILURE_THRESHOLD {
         "unhealthy"
-    } else if !people_connected || !asset_hub_connected || fund_failures > 0 {
+    } else if !people_connected || !asset_hub_connected || reserve_failures > 0 {
         "degraded"
     } else {
         "ok"
@@ -189,11 +198,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         asset_hub_connected,
         last_block_at: *state.last_block_at.read().await,
         cursor_block_hash: state.cursor_block_hash.read().await.clone(),
-        funding_key_balance: *state.funding_key_balance.read().await,
         registrations_seen: state.registrations_seen.load(Ordering::Relaxed),
-        accounts_funded: state.accounts_funded.load(Ordering::Relaxed),
-        accounts_skipped: state.accounts_skipped.load(Ordering::Relaxed),
-        fund_failures,
+        names_reserved: state.names_reserved.load(Ordering::Relaxed),
+        names_skipped: state.names_skipped.load(Ordering::Relaxed),
+        reserve_failures,
         uptime_seconds: state.started_at.elapsed().as_secs(),
     })
 }
@@ -213,33 +221,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Fat-finger guard on the funding amount (#17).
-    if cli.amount == 0 {
-        return Err("FUNDER_AMOUNT_PLANCK must be greater than 0".into());
-    }
-    if cli.amount > cli.max_amount {
-        return Err(format!(
-            "FUNDER_AMOUNT_PLANCK ({}) exceeds --max-amount-planck ({}); raise the ceiling deliberately if intended",
-            cli.amount, cli.max_amount
-        )
-        .into());
-    }
-
     let state = AppState {
         people_connected: Arc::new(RwLock::new(false)),
         asset_hub_connected: Arc::new(RwLock::new(false)),
         last_block_at: Arc::new(RwLock::new(None)),
         cursor_block_hash: Arc::new(RwLock::new(None)),
-        funding_key_balance: Arc::new(RwLock::new(None)),
         registrations_seen: Arc::new(AtomicU64::new(0)),
-        accounts_funded: Arc::new(AtomicU64::new(0)),
-        accounts_skipped: Arc::new(AtomicU64::new(0)),
-        fund_failures: Arc::new(AtomicU64::new(0)),
+        names_reserved: Arc::new(AtomicU64::new(0)),
+        names_skipped: Arc::new(AtomicU64::new(0)),
+        reserve_failures: Arc::new(AtomicU64::new(0)),
         started_at: std::time::Instant::now(),
     };
 
     // Bind the health endpoint in `main` so a bind failure fails startup loudly,
-    // instead of a `.expect` panic silently killing a spawned task (#6).
+    // instead of a `.expect` panic silently killing a spawned task.
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.health_bind, cli.health_port))
         .await
         .map_err(|e| {
@@ -259,58 +254,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let signer = build_signer(&cli)?;
-    let mut funder = Funder::connect(
+    let proxy_for = match cli.proxy_for.as_deref() {
+        Some(s) => Some(
+            s.parse::<AccountId32>()
+                .map_err(|e| format!("invalid --proxy-for SS58 address {s:?}: {e}"))?,
+        ),
+        None => None,
+    };
+    let mut reserver = Reserver::connect(
         &cli.asset_hub_url,
         signer,
-        cli.amount,
-        cli.max_submit_retries,
+        proxy_for,
         cli.batch_size,
+        cli.max_submit_retries,
     )
     .await
     .map_err(|e| format!("failed to connect to Asset Hub: {e}"))?;
     *state.asset_hub_connected.write().await = true;
-    let signer_account = *funder.signer_account();
+    let signer_account = *reserver.signer_account();
 
     let cursor_store = CursorStore::new(cli.cursor_file.clone());
 
     info!(
         people_url = %cli.people_url,
         asset_hub_url = %cli.asset_hub_url,
-        funder = %signer_account,
-        amount_planck = cli.amount,
+        reserver = %signer_account,
+        proxy_for = ?proxy_for.as_ref().map(|a| a.to_string()),
         batch_size = cli.batch_size,
         cursor_file = %cli.cursor_file,
         dry_run = cli.dry_run,
-        "starting flow-funder (LitePeople storageDiff → Asset Hub batch_all transfer_keep_alive)"
+        "starting flow-funder (PeopleLite::attest → DotnsGateway::reserve_name)"
     );
 
-    // Periodically refresh the funding key's balance on a dedicated read-only
-    // connection so /health surfaces funding exhaustion proactively (#10).
-    {
-        let state = state.clone();
-        let url = cli.asset_hub_url.clone();
-        let account = signer_account;
-        tokio::spawn(async move {
-            loop {
-                match RpcClient::from_url(&url).await {
-                    Ok(rpc) => {
-                        match asset_hub::fetch_free_balances(&rpc, std::slice::from_ref(&account)).await {
-                            Ok(balances) => {
-                                *state.funding_key_balance.write().await = balances.first().copied();
-                            }
-                            Err(e) => warn!(error = %e, "balance gauge query failed"),
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "balance gauge connect failed"),
-                }
-                tokio::time::sleep(BALANCE_GAUGE_INTERVAL).await;
-            }
-        });
-    }
-
-    // Graceful shutdown (#15): first Ctrl-C sets the flag so the current cycle
-    // finishes its in-flight work and stops before the next block; a second
-    // Ctrl-C force-quits.
+    // Graceful shutdown: first Ctrl-C sets the flag so the current cycle finishes
+    // its in-flight work and stops before the next block; a second Ctrl-C
+    // force-quits.
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
     {
@@ -331,7 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut backoff = RECONNECT_BACKOFF_INITIAL;
 
     while !shutdown.load(Ordering::SeqCst) {
-        match run_people_cycle(&cli, &mut funder, &cursor_store, &state, &shutdown).await {
+        match run_people_cycle(&cli, &mut reserver, &cursor_store, &state, &shutdown).await {
             Ok(()) => {
                 // Clean stream end (or graceful stop): reset backoff.
                 backoff = RECONNECT_BACKOFF_INITIAL;
@@ -350,9 +328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         registrations_seen = state.registrations_seen.load(Ordering::Relaxed),
-        accounts_funded = state.accounts_funded.load(Ordering::Relaxed),
-        accounts_skipped = state.accounts_skipped.load(Ordering::Relaxed),
-        fund_failures = state.fund_failures.load(Ordering::Relaxed),
+        names_reserved = state.names_reserved.load(Ordering::Relaxed),
+        names_skipped = state.names_skipped.load(Ordering::Relaxed),
+        reserve_failures = state.reserve_failures.load(Ordering::Relaxed),
         uptime_seconds = state.started_at.elapsed().as_secs(),
         "shutting down"
     );
@@ -366,12 +344,12 @@ enum ProcessOutcome {
 }
 
 /// One People-chain connection cycle: connect, resolve the starting block from
-/// the persisted cursor (or the finalized head on first boot), then process
-/// finalized blocks until the subscription ends, the stream goes silent, or
-/// shutdown is requested.
+/// the persisted cursor (or the finalized head on first boot), then process every
+/// finalized block up to the streamed head until the subscription ends, the
+/// stream goes silent, or shutdown is requested.
 async fn run_people_cycle(
     cli: &Cli,
-    funder: &mut Funder,
+    reserver: &mut Reserver,
     cursor_store: &CursorStore,
     state: &AppState,
     shutdown: &AtomicBool,
@@ -381,17 +359,19 @@ async fn run_people_cycle(
     let api = OnlineClient::<SubstrateConfig>::from_rpc_client(rpc.clone()).await?;
     *state.people_connected.write().await = true;
 
-    // Resume from the persisted cursor; only first boot starts at the tip.
-    let mut prev_block_hash = match cursor_store.load().await? {
+    // Resolve the last fully-handled block; only first boot starts at the tip.
+    let mut last_number = match cursor_store.load().await? {
         Some(hash) => {
-            info!(cursor = %format_args!("{hash:?}"), "resuming from persisted cursor");
+            let number = api.at_block(hash).await?.block_header().await?.number();
+            info!(cursor = %format_args!("{hash:?}"), number, "resuming from persisted cursor");
             *state.cursor_block_hash.write().await = Some(format!("{hash:?}"));
-            hash
+            number
         }
         None => {
             let head = finalized_head(&rpc).await?;
-            info!(head = %format_args!("{head:?}"), "first boot — starting from finalized head");
-            head
+            let number = api.at_block(head).await?.block_header().await?.number();
+            info!(head = %format_args!("{head:?}"), number, "first boot — starting from finalized head");
+            number
         }
     };
 
@@ -399,137 +379,143 @@ async fn run_people_cycle(
     info!("subscribed to finalized blocks");
 
     loop {
-        // Stop between blocks (never mid-submit) so in-flight funding completes.
+        // Stop between blocks (never mid-submit) so in-flight work completes.
         if shutdown.load(Ordering::SeqCst) {
             info!("stopping People cycle for shutdown");
             return Ok(());
         }
 
         // Bound the wait: a WS that stays open but stops sending must trigger a
-        // reconnect, not an indefinite hang (#4).
+        // reconnect, not an indefinite hang.
         let block = match tokio::time::timeout(BLOCK_RECV_TIMEOUT, sub.next()).await {
             Ok(Some(block_result)) => block_result?,
-            Ok(None) => return Ok(()), // stream closed cleanly (#16)
+            Ok(None) => return Ok(()), // stream closed cleanly
             Err(_) => return Err("People block stream timed out — reconnecting".into()),
         };
-
-        let block_number = block.number();
-        let block_hash = block.hash();
+        let target = block.number();
         *state.last_block_at.write().await = Some(unix_timestamp_now());
 
-        match process_block(cli, funder, state, &rpc, block_number, block_hash, prev_block_hash).await
-        {
-            ProcessOutcome::Advance => {
-                // Advance the live cursor. Persist it too, unless this is a dry
-                // run (a dry run must not advance a real cursor past unfunded
-                // accounts).
-                prev_block_hash = block_hash;
-                if !cli.dry_run {
-                    cursor_store.save(block_hash).await?;
-                    *state.cursor_block_hash.write().await = Some(format!("{block_hash:?}"));
-                }
+        // Process every finalized block in (last_number, target], one at a time,
+        // advancing the cursor per block. This fills any gap the finalized stream
+        // skipped or a reconnect left behind — preserving the no-missed guarantee.
+        while last_number < target {
+            if shutdown.load(Ordering::SeqCst) {
+                info!("stopping People cycle for shutdown");
+                return Ok(());
             }
-            ProcessOutcome::Pin => {
-                // Leave prev_block_hash unchanged so the next diff re-covers this
-                // block; the balance check skips accounts already funded.
+            let number = last_number + 1;
+            let at = api.at_block(number).await?;
+            let block_hash = at.block_hash();
+
+            match process_block(cli, reserver, state, number, block_hash, &at).await {
+                ProcessOutcome::Advance => {
+                    last_number = number;
+                    // Persist the cursor, unless this is a dry run (a dry run must
+                    // not advance a real cursor past unreserved names).
+                    if !cli.dry_run {
+                        cursor_store.save(block_hash).await?;
+                        *state.cursor_block_hash.write().await = Some(format!("{block_hash:?}"));
+                    }
+                }
+                ProcessOutcome::Pin => {
+                    // Leave last_number unchanged so this block is retried when the
+                    // next block streams in; reserved names are skipped on retry.
+                    break;
+                }
             }
         }
     }
 }
 
-/// Diff one block, log its registrations, and fund them. Returns whether the
-/// cursor may advance. Pure plumbing extracted from the cycle loop (#19).
+/// Decode one block's attests, log its registrations, and reserve them. Returns
+/// whether the cursor may advance.
 async fn process_block(
     cli: &Cli,
-    funder: &mut Funder,
+    reserver: &mut Reserver,
     state: &AppState,
-    rpc: &RpcClient,
     block_number: u64,
     block_hash: H256,
-    prev_block_hash: H256,
+    at: &OnlineClientAtBlock<SubstrateConfig>,
 ) -> ProcessOutcome {
-    let added = match diff_added_accounts(rpc, block_hash, prev_block_hash).await {
-        Ok(accounts) => accounts,
+    let inputs = match reservations_in_block(at).await {
+        Ok(inputs) => inputs,
         Err(e) => {
-            warn!(block = block_number, error = %e, "storageDiff failed — leaving cursor pinned");
+            warn!(block = block_number, error = %e, "decoding attests failed — leaving cursor pinned");
             return ProcessOutcome::Pin;
         }
     };
 
-    let accounts: Vec<AccountId32> = added.into_iter().map(AccountId32).collect();
-    for account in &accounts {
+    for input in &inputs {
         state.registrations_seen.fetch_add(1, Ordering::Relaxed);
         info!(
-            account = %account,
+            username = %String::from_utf8_lossy(&input.lite_label),
             block = block_number,
             block_hash = %format_args!("{block_hash:?}"),
-            "new lite identity registered on People chain"
+            "username registered on People chain"
         );
     }
 
-    if accounts.is_empty() {
+    if inputs.is_empty() {
         return ProcessOutcome::Advance;
     }
 
-    if handle_block(funder, &accounts, block_number, cli, state).await {
+    if handle_block(reserver, &inputs, block_number, cli, state).await {
         ProcessOutcome::Advance
     } else {
         warn!(
             block = block_number,
-            "block has unhandled accounts — cursor pinned; block will be retried (funded accounts are skipped)"
+            "block has unreserved names — cursor pinned; block will be retried (reserved names are skipped)"
         );
         ProcessOutcome::Pin
     }
 }
 
-/// Handle all of a block's registrations in one batched pass. Returns `true` if
-/// the block was fully handled (funded/skipped, or — in dry-run — planned),
-/// `false` if funding failed (so the caller pins the cursor and retries later).
+/// Reserve all of a block's names in one pass. Returns `true` if the block was
+/// fully handled (reserved/skipped, or — in dry-run — planned), `false` if a
+/// reservation failed (so the caller pins the cursor and retries later).
 async fn handle_block(
-    funder: &mut Funder,
-    accounts: &[AccountId32],
+    reserver: &mut Reserver,
+    inputs: &[attest::ReservationInputs],
     block_number: u64,
     cli: &Cli,
     state: &AppState,
 ) -> bool {
     if cli.dry_run {
-        match funder.dry_run_batch(accounts).await {
+        match reserver.dry_run_block(inputs).await {
             Ok(report) => info!(
                 block = block_number,
-                would_fund = report.would_fund,
+                would_reserve = report.would_reserve,
                 skipped = report.skipped,
-                batches = report.batches,
                 encoded_bytes = report.encoded_bytes,
-                "dry-run — batch_all encodes against live metadata; not submitting"
+                "dry-run — reserve_name encodes against live metadata; not submitting"
             ),
-            Err(e) => warn!(block = block_number, error = %e, "dry-run batch planning failed"),
+            Err(e) => warn!(block = block_number, error = %e, "dry-run reservation planning failed"),
         }
         return true;
     }
 
-    match funder.fund_batch(accounts).await {
+    match reserver.reserve_block(inputs).await {
         Ok(outcome) => {
             *state.asset_hub_connected.write().await = true;
             state
-                .accounts_funded
-                .fetch_add(outcome.funded as u64, Ordering::Relaxed);
+                .names_reserved
+                .fetch_add(outcome.reserved as u64, Ordering::Relaxed);
             state
-                .accounts_skipped
+                .names_skipped
                 .fetch_add(outcome.skipped as u64, Ordering::Relaxed);
             info!(
                 block = block_number,
-                funded = outcome.funded,
+                reserved = outcome.reserved,
                 skipped = outcome.skipped,
-                batches = outcome.tx_hashes.len(),
                 tx_hashes = ?outcome.tx_hashes,
-                "block funded"
+                "block reserved"
             );
             true
         }
         Err(e) => {
-            state.fund_failures.fetch_add(1, Ordering::Relaxed);
-            error!(block = block_number, error = %e, "batch funding failed — attempting Asset Hub reconnect");
-            match funder.reconnect(&cli.asset_hub_url).await {
+            state.reserve_failures.fetch_add(1, Ordering::Relaxed);
+            error!(block = block_number, error = %e, "reservation failed — attempting Asset Hub reconnect");
+            match reserver.reconnect(&cli.asset_hub_url).await {
                 Ok(()) => *state.asset_hub_connected.write().await = true,
                 Err(re) => {
                     *state.asset_hub_connected.write().await = false;
@@ -546,13 +532,29 @@ async fn handle_block(
 // ---------------------------------------------------------------------------
 
 fn build_signer(cli: &Cli) -> Result<Keypair, Box<dyn std::error::Error>> {
+    // A raw 32-byte secret key (identity-backend's format) takes precedence.
+    if let Some(hex_key) = cli.secret_key.as_deref() {
+        let bytes = hex::decode(hex_key.trim().strip_prefix("0x").unwrap_or(hex_key.trim()))
+            .map_err(|e| format!("invalid --secret-key hex: {e}"))?;
+        let secret: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "--secret-key must be 32 bytes (sr25519 mini-secret)")?;
+        return Keypair::from_secret_key(secret)
+            .map_err(|e| format!("invalid --secret-key: {e}").into());
+    }
+
     let seed_phrase = match cli.seed_phrase.as_deref() {
         Some(seed_phrase) => seed_phrase,
         None if cli.dry_run => {
             "bottom drive obey lake curtain smoke basket hold race lonely fit walk"
         }
         None => {
-            return Err("FUNDER_SEED_PHRASE or --seed-phrase is required for live funding".into());
+            return Err(
+                "one of --secret-key or --seed-phrase is required (the signing key — \
+                 with proxy delegation, identity-backend's ATTESTER_PROXY_PRIVATE_KEY) \
+                 for live reservation"
+                    .into(),
+            );
         }
     };
     let derivation_path = cli
@@ -586,11 +588,11 @@ mod tests {
             people_url: "ws://people".to_string(),
             asset_hub_url: "ws://asset-hub".to_string(),
             seed_phrase: seed_phrase.map(str::to_string),
+            secret_key: None,
             derivation_path: None,
-            amount: 100,
-            max_amount: 1_000_000_000_000_000,
+            proxy_for: None,
+            batch_size: 50,
             max_submit_retries: 3,
-            batch_size: 100,
             cursor_file: "cursor.txt".to_string(),
             dry_run,
             health_port: 3033,
@@ -599,13 +601,28 @@ mod tests {
     }
 
     #[test]
-    fn build_signer_requires_explicit_seed_for_live_funding() {
+    fn build_signer_requires_explicit_seed_for_live_reservation() {
         let err = build_signer(&cli_for_signer(false, None)).unwrap_err();
-        assert!(err.to_string().contains("required for live funding"));
+        assert!(err.to_string().contains("required"));
     }
 
     #[test]
     fn build_signer_allows_dev_seed_for_dry_run() {
         assert!(build_signer(&cli_for_signer(true, None)).is_ok());
+    }
+
+    #[test]
+    fn build_signer_accepts_raw_secret_key_hex() {
+        let mut cli = cli_for_signer(false, None);
+        cli.secret_key = Some(format!("0x{}", "11".repeat(32))); // 32-byte mini-secret
+        assert!(build_signer(&cli).is_ok());
+    }
+
+    #[test]
+    fn build_signer_rejects_wrong_length_secret_key() {
+        let mut cli = cli_for_signer(false, None);
+        cli.secret_key = Some("0x1234".to_string());
+        let err = build_signer(&cli).unwrap_err().to_string();
+        assert!(err.contains("32 bytes"));
     }
 }
