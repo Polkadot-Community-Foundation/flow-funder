@@ -1,11 +1,11 @@
-//! Asset Hub funding side.
+//! Asset Hub dotns-reservation side.
 //!
 //! Holds a custom subxt `Config` pinned to Paseo Asset Hub Next's live
 //! transaction-extension set (verified with the `dump-extensions` bin — see the
-//! `AssetHubConfig` comment), a native-token balance query, and the
-//! `balances.transfer_keep_alive` submission with nonce caching + retry.
+//! `AssetHubConfig` comment), the `DotnsGateway::LiteLabelOwner` idempotency read,
+//! and the `DotnsGateway::reserve_name` submission with nonce caching + retry. The
+//! signing key must hold `AttestationAllowance` on the gateway pallet.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use scale_info::PortableRegistry;
@@ -26,11 +26,8 @@ use subxt_rpcs::{rpc_params, RpcClient};
 use subxt_signer::sr25519::Keypair;
 use tracing::{info, warn};
 
-use crate::registration::{free_balance_from_account_info, funding_shortfall, system_account_key};
-
-/// Max accounts per `state_queryStorageAt` balance read. Keeps each request a
-/// reasonable size while still collapsing a big catch-up into a handful of RPCs.
-const READ_CHUNK: usize = 512;
+use crate::attest::ReservationInputs;
+use crate::registration::lite_label_owner_key;
 
 /// Max time to wait for a submitted tx to finalize before treating the attempt
 /// as failed (retriable). ~5× a generous block time — a tx stuck in the pool
@@ -255,54 +252,54 @@ fn build_params(
 // Funder
 // ---------------------------------------------------------------------------
 
-/// Outcome of funding all the registrations observed in one block.
+/// Outcome of reserving every name observed in one block.
 #[derive(Debug)]
-pub struct BatchOutcome {
-    /// Accounts included in a submitted + finalized batch.
-    pub funded: usize,
-    /// Accounts already at/above target — nothing submitted for them.
+pub struct BlockReserveOutcome {
+    /// Names submitted in a finalized `reserve_name` extrinsic.
+    pub reserved: usize,
+    /// Names already reserved on-chain — nothing submitted for them.
     pub skipped: usize,
-    /// One extrinsic hash per `batch_all` chunk submitted. Empty if nothing
-    /// needed funding.
+    /// One extrinsic hash per `reserve_name` submitted. Empty if nothing was new.
     pub tx_hashes: Vec<String>,
 }
 
-/// What a dry run would do for one block's registrations.
+/// What a dry run would do for one block's names.
 #[derive(Debug)]
 pub struct DryRunReport {
-    pub would_fund: usize,
+    pub would_reserve: usize,
     pub skipped: usize,
-    /// Number of `batch_all` chunks the funding would be split into.
-    pub batches: usize,
-    /// Total SCALE-encoded call-data bytes across all chunks. Producing these
-    /// encodes each `batch_all` against live metadata, so it doubles as proof
-    /// that `Utility.batch_all` and the inner calls exist and encode — without
-    /// submitting anything.
+    /// Total SCALE-encoded call-data bytes across the names that would be
+    /// reserved. Producing these encodes each `reserve_name` against live
+    /// metadata, so it doubles as proof the call and its harvested args encode —
+    /// without submitting anything.
     pub encoded_bytes: usize,
 }
 
-/// Owns the Asset Hub connection, the signer, and the funding policy.
-pub struct Funder {
+/// Owns the Asset Hub connection and the allowance-holding signer.
+pub struct Reserver {
     api: OnlineClient<AssetHubConfig>,
-    /// Raw RPC over the same connection as `api`, for batched `state_queryStorageAt`.
+    /// Raw RPC over the same connection as `api`, for `state_queryStorageAt`.
     rpc: RpcClient,
     signer: Keypair,
     signer_account: AccountId32,
-    target_amount: u128,
-    max_retries: u32,
-    /// Max `transfer_keep_alive` calls per `batch_all` extrinsic.
+    /// When set, submit reservations wrapped in `Proxy.proxy(real = this, …)` —
+    /// for when the `AttestationAllowance` is held by this real account and the
+    /// signer is its proxy delegate, rather than the signer holding it directly.
+    proxy_for: Option<AccountId32>,
+    /// Max `reserve_name` calls per `Utility.force_batch` extrinsic.
     batch_size: usize,
-    /// Locally-advanced nonce; see `submit_batch`.
+    max_retries: u32,
+    /// Locally-advanced nonce; see `submit`.
     next_nonce: Option<u64>,
 }
 
-impl Funder {
+impl Reserver {
     pub async fn connect(
         url: &str,
         signer: Keypair,
-        target_amount: u128,
-        max_retries: u32,
+        proxy_for: Option<AccountId32>,
         batch_size: usize,
+        max_retries: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let rpc = RpcClient::from_url(url).await?;
         let api = OnlineClient::<AssetHubConfig>::from_rpc_client(rpc.clone()).await?;
@@ -312,9 +309,9 @@ impl Funder {
             rpc,
             signer,
             signer_account,
-            target_amount,
-            max_retries,
+            proxy_for,
             batch_size: batch_size.max(1),
+            max_retries,
             next_nonce: None,
         })
     }
@@ -338,104 +335,117 @@ impl Funder {
         Ok(())
     }
 
-    /// Read many accounts' free balances over this funder's connection.
-    pub async fn query_free_balances(
+    /// Whether a name is already reserved — i.e. `DotnsGateway::LiteLabelOwner`
+    /// has an entry for it. Makes reservation idempotent: re-processing a block
+    /// re-reads this and skips names that already landed.
+    pub async fn is_name_reserved(
         &self,
-        accounts: &[AccountId32],
-    ) -> Result<Vec<u128>, Box<dyn std::error::Error + Send + Sync>> {
-        fetch_free_balances(&self.rpc, accounts).await
-    }
-
-    /// Query balances (batched) and split `accounts` into those that still need
-    /// funding — paired with their shortfall to target — and a count of those
-    /// already at or above target.
-    async fn plan_funding(
-        &self,
-        accounts: &[AccountId32],
-    ) -> Result<(Vec<(AccountId32, u128)>, usize), Box<dyn std::error::Error + Send + Sync>> {
-        let balances = self.query_free_balances(accounts).await?;
-        let mut to_fund = Vec::new();
-        let mut skipped = 0usize;
-        for (account, free) in accounts.iter().zip(balances) {
-            match funding_shortfall(free, self.target_amount) {
-                Some(shortfall) => to_fund.push((*account, shortfall)),
-                None => skipped += 1,
+        lite_label: &[u8],
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let key = format!("0x{}", hex::encode(lite_label_owner_key(lite_label)));
+        // [{ "block": "0x..", "changes": [["0xkey", "0xvalue" | null], …] }]
+        let result: Vec<serde_json::Value> = self
+            .rpc
+            .request("state_queryStorageAt", rpc_params![[key.clone()]])
+            .await?;
+        for set in &result {
+            let Some(changes) = set.get("changes").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for pair in changes {
+                let Some(arr) = pair.as_array() else { continue };
+                let key_matches = arr
+                    .first()
+                    .and_then(|k| k.as_str())
+                    .is_some_and(|k| k.eq_ignore_ascii_case(&key));
+                // A present, non-null value means the name is owned/reserved.
+                let has_value = arr.get(1).is_some_and(|v| !v.is_null());
+                if key_matches && has_value {
+                    return Ok(true);
+                }
             }
         }
-        Ok((to_fund, skipped))
+        Ok(false)
     }
 
-    /// Fund every account in a block in as few transactions as possible: the
-    /// accounts needing funding are chunked into `batch_size`-sized
-    /// `Utility.batch_all` extrinsics, each submitted once. Already-funded
-    /// accounts are skipped (idempotent). A chunk failure propagates as `Err`,
-    /// so the caller pins the cursor and the block is retried — the balance
-    /// check then skips the chunks that already landed.
-    pub async fn fund_batch(
+    /// Reserve every name harvested from one block. Names not already reserved
+    /// are chunked into `batch_size`-sized `Utility.force_batch` extrinsics (one
+    /// submission each, optionally proxy-wrapped — mirroring identity-backend),
+    /// each awaited to finalization. A submission failure propagates as `Err`, so
+    /// the caller pins the cursor and the block is retried — the `LiteLabelOwner`
+    /// check then skips names that already landed.
+    ///
+    /// `force_batch` is non-atomic: an individual `reserve_name` that fails on
+    /// chain does not revert the others, so one bad name can't block the rest of
+    /// the batch (it also won't be retried once the extrinsic finalizes).
+    pub async fn reserve_block(
         &mut self,
-        accounts: &[AccountId32],
-    ) -> Result<BatchOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let (to_fund, skipped) = self.plan_funding(accounts).await?;
-        if to_fund.is_empty() {
-            return Ok(BatchOutcome { funded: 0, skipped, tx_hashes: Vec::new() });
-        }
+        inputs: &[ReservationInputs],
+    ) -> Result<BlockReserveOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let (to_reserve, skipped) = self.filter_unreserved(inputs).await?;
 
-        let mut funded = 0usize;
+        let mut reserved = 0usize;
         let mut tx_hashes = Vec::new();
-        for chunk in to_fund.chunks(self.batch_size) {
-            let tx_hash = self.submit_batch(chunk).await?;
-            funded += chunk.len();
+        for chunk in to_reserve.chunks(self.batch_size) {
+            let payload = build_batch_payload(chunk, self.proxy_for.as_ref());
+            let tx_hash = self.submit(&payload, &batch_label(chunk)).await?;
+            reserved += chunk.len();
             tx_hashes.push(tx_hash);
         }
-        Ok(BatchOutcome { funded, skipped, tx_hashes })
+        Ok(BlockReserveOutcome { reserved, skipped, tx_hashes })
     }
 
-    /// Dry-run planning: compute who would be funded and encode each `batch_all`
-    /// chunk against live metadata (via `call_data`) to prove it's valid —
-    /// without submitting anything.
-    pub async fn dry_run_batch(
+    /// Dry-run: count names that would be reserved (skipping already-reserved
+    /// ones) and encode each `force_batch` against live metadata to prove it's
+    /// valid — without submitting anything.
+    pub async fn dry_run_block(
         &self,
-        accounts: &[AccountId32],
+        inputs: &[ReservationInputs],
     ) -> Result<DryRunReport, Box<dyn std::error::Error + Send + Sync>> {
-        let (to_fund, skipped) = self.plan_funding(accounts).await?;
+        let (to_reserve, skipped) = self.filter_unreserved(inputs).await?;
+        let tx_client = self.api.tx().await?;
         let mut encoded_bytes = 0usize;
-        let mut batches = 0usize;
-        if !to_fund.is_empty() {
-            let tx_client = self.api.tx().await?;
-            for chunk in to_fund.chunks(self.batch_size) {
-                let payload = build_batch_payload(chunk);
-                encoded_bytes += tx_client.call_data(&payload)?.len();
-                batches += 1;
+        for chunk in to_reserve.chunks(self.batch_size) {
+            let payload = build_batch_payload(chunk, self.proxy_for.as_ref());
+            encoded_bytes += tx_client.call_data(&payload)?.len();
+        }
+        Ok(DryRunReport { would_reserve: to_reserve.len(), skipped, encoded_bytes })
+    }
+
+    /// Split inputs into those not yet reserved (to submit) and a count of those
+    /// already reserved on chain (skipped), via the `LiteLabelOwner` check.
+    async fn filter_unreserved<'a>(
+        &self,
+        inputs: &'a [ReservationInputs],
+    ) -> Result<(Vec<&'a ReservationInputs>, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let mut to_reserve = Vec::new();
+        let mut skipped = 0usize;
+        for input in inputs {
+            if self.is_name_reserved(&input.lite_label).await? {
+                skipped += 1;
+            } else {
+                to_reserve.push(input);
             }
         }
-        Ok(DryRunReport {
-            would_fund: to_fund.len(),
-            skipped,
-            batches,
-            encoded_bytes,
-        })
+        Ok((to_reserve, skipped))
     }
 
-    /// Submit one `Utility.batch_all` of `transfer_keep_alive` calls, waiting for
-    /// finalized inclusion, with nonce caching + bounded retry on transient pool
-    /// rejections. `batch_all` is atomic: either every transfer in the chunk
-    /// lands or none do, so a failed chunk leaves no partial state — the caller
-    /// pins the cursor and the chunk is retried cleanly.
-    async fn submit_batch(
+    /// Submit one `DotnsGateway.reserve_name`, waiting for finalized inclusion,
+    /// with nonce caching + bounded retry on transient pool rejections.
+    async fn submit(
         &mut self,
-        chunk: &[(AccountId32, u128)],
+        payload: &subxt::transactions::DynamicPayload<Vec<Value>>,
+        label: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let payload = build_batch_payload(chunk);
-        let batch_len = chunk.len();
         let mut last_err: Option<String> = None;
 
         for attempt in 0..=self.max_retries {
-            match self.try_submit_once(&payload, batch_len, attempt).await {
+            match self.try_submit_once(payload, label, attempt).await {
                 AttemptOutcome::Done(tx_hash) => return Ok(tx_hash),
                 AttemptOutcome::Retry(err) if attempt < self.max_retries => {
                     // Any failed attempt invalidates the cached nonce.
                     self.next_nonce = None;
-                    warn!(batch_len, attempt, error = %err, "batch attempt failed — refreshing nonce and retrying");
+                    warn!(label, attempt, error = %err, "reserve_name attempt failed — refreshing nonce and retrying");
                     last_err = Some(err);
                     backoff(attempt).await;
                 }
@@ -461,7 +471,7 @@ impl Funder {
     async fn try_submit_once(
         &mut self,
         payload: &subxt::transactions::DynamicPayload<Vec<Value>>,
-        batch_len: usize,
+        label: &str,
         attempt: u32,
     ) -> AttemptOutcome {
         let mut tx_client = match self.api.tx().await {
@@ -480,7 +490,7 @@ impl Funder {
             },
         };
 
-        info!(batch_len, attempt, nonce, "submitting Utility.batch_all of transfer_keep_alive");
+        info!(label, attempt, nonce, "submitting DotnsGateway.reserve_name");
 
         let progress = match tx_client
             .sign_and_submit_then_watch(payload, &self.signer, build_params(nonce))
@@ -507,7 +517,7 @@ impl Funder {
             Ok(Err(e)) => classify_submit_err(e),
             Ok(Ok(())) => {
                 self.next_nonce = Some(nonce + 1);
-                info!(batch_len, tx_hash = %tx_hash, "batch finalized");
+                info!(label, tx_hash = %tx_hash, "reserve_name finalized");
                 AttemptOutcome::Done(tx_hash)
             }
         }
@@ -531,83 +541,88 @@ fn classify_submit_err(message: String) -> AttemptOutcome {
     }
 }
 
-/// Read many accounts' free balances in one `state_queryStorageAt` per
-/// `READ_CHUNK` accounts (instead of a fetch per account), returning a free
-/// balance for each input account in order. Absent account → 0. A free function
-/// so a read-only consumer (e.g. the health balance gauge) can use it with its
-/// own RPC connection, no signer required.
-pub async fn fetch_free_balances(
-    rpc: &RpcClient,
-    accounts: &[AccountId32],
-) -> Result<Vec<u128>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut out = Vec::with_capacity(accounts.len());
-    for chunk in accounts.chunks(READ_CHUNK) {
-        let keys: Vec<String> = chunk
-            .iter()
-            .map(|a| format!("0x{}", hex::encode(system_account_key(&a.0))))
-            .collect();
+/// Build one `DotnsGateway::reserve_name(...)` as a `RuntimeCall` value, for
+/// nesting inside `Utility.force_batch`, from the inputs harvested out of a
+/// `PeopleLite::attest` call.
+///
+/// NOTE: this 7-arg shape matches the individuality `w3s-dotnsgateway-workaround`
+/// branch (commit "[W3S only] … same signature as in people-lite pallet"), which
+/// makes `reserve_name` verify the same message as `attest` so the attest
+/// signatures are reusable. The pre-workaround pallet currently deployed on
+/// paseo-asset-hub-next has a different 6-arg shape (no ring_vrf_key/proof, plus a
+/// `signed_at: u64`); encoding will fail there until the chain runs the workaround
+/// runtime. The bot is intentionally built for the workaround pallet.
+///
+/// The first four args are passed through verbatim as the decoded `Value`s — they
+/// re-encode structurally against Asset Hub's metadata (same runtime types). The
+/// last three are rebuilt from harvested bytes so they match the target
+/// `BaseLabel`/`ChatKey` newtypes rather than the bare `BoundedVec`/`[u8;65]` the
+/// People chain encoded them as.
+fn build_reserve_name_call(input: &ReservationInputs) -> Value {
+    let reserved_base_label = match &input.reserved_base_label {
+        Some(label) => Value::unnamed_variant("Some", [Value::from_bytes(label)]),
+        None => Value::unnamed_variant("None", []),
+    };
 
-        // [{ "block": "0x..", "changes": [["0xkey", "0xvalue" | null], …] }]
-        let result: Vec<serde_json::Value> = rpc
-            .request("state_queryStorageAt", rpc_params![keys.clone()])
-            .await?;
+    let args = vec![
+        input.candidate.clone(),
+        input.candidate_signature.clone(),
+        input.ring_vrf_key.clone(),
+        input.proof_of_ownership.clone(),
+        Value::from_bytes(&input.lite_label), // lite_label: BaseLabel
+        Value::from_bytes(input.chat_key),    // chat_key: ChatKey([u8; 65])
+        reserved_base_label,                  // reserved_base_label: Option<BaseLabel>
+    ];
 
-        let mut values: HashMap<String, String> = HashMap::new();
-        for set in &result {
-            let Some(changes) = set.get("changes").and_then(|c| c.as_array()) else {
-                continue;
-            };
-            for pair in changes {
-                let Some(arr) = pair.as_array() else { continue };
-                if let (Some(key), Some(value)) =
-                    (arr.first().and_then(|k| k.as_str()), arr.get(1).and_then(|v| v.as_str()))
-                {
-                    values.insert(key.to_lowercase(), value.to_string());
-                }
-                // A null value means the account does not exist yet → free 0.
-            }
-        }
-
-        for key in &keys {
-            match values.get(&key.to_lowercase()) {
-                Some(value_hex) => {
-                    let bytes = hex::decode(value_hex.strip_prefix("0x").unwrap_or(value_hex))?;
-                    out.push(
-                        free_balance_from_account_info(&bytes)
-                            .ok_or("failed to decode System.Account AccountInfo")?,
-                    );
-                }
-                None => out.push(0),
-            }
-        }
-    }
-    Ok(out)
+    Value::unnamed_variant("DotnsGateway", [Value::unnamed_variant("reserve_name", args)])
 }
 
-/// Build a `Utility.batch_all([Balances.transfer_keep_alive(dest, shortfall), …])`
-/// dynamic payload for one chunk of (account, shortfall) pairs.
+/// Build a `Utility.force_batch([reserve_name, …])` payload for one chunk of
+/// names, optionally wrapped in `Proxy.proxy(real, Some(Any), call)` when the
+/// signer is a proxy delegate of the allowance-holding account. Mirrors how
+/// identity-backend submits (force_batch under a proxy, `force_proxy_type = Any`).
+/// `force_batch` is non-atomic, so a single failing `reserve_name` doesn't revert
+/// the batch.
 fn build_batch_payload(
-    chunk: &[(AccountId32, u128)],
+    chunk: &[&ReservationInputs],
+    proxy_for: Option<&AccountId32>,
 ) -> subxt::transactions::DynamicPayload<Vec<Value>> {
-    let calls: Vec<Value> = chunk
-        .iter()
-        .map(|(account, shortfall)| {
-            Value::unnamed_variant(
-                "Balances",
-                [Value::unnamed_variant(
-                    "transfer_keep_alive",
-                    [
-                        // dest: MultiAddress::Id(account)
-                        Value::unnamed_variant("Id", [Value::from_bytes(account.0)]),
-                        // value: Balance
-                        Value::u128(*shortfall),
-                    ],
-                )],
-            )
-        })
-        .collect();
+    let calls: Vec<Value> = chunk.iter().map(|i| build_reserve_name_call(i)).collect();
 
-    subxt::dynamic::tx("Utility", "batch_all", vec![Value::unnamed_composite(calls)])
+    match proxy_for {
+        // Direct: the signer holds the gateway AttestationAllowance.
+        None => {
+            subxt::dynamic::tx("Utility", "force_batch", vec![Value::unnamed_composite(calls)])
+        }
+        // Proxied: Proxy.proxy(real, Some(ProxyType::Any), Utility.force_batch([…])).
+        Some(real) => {
+            let batch_call = Value::unnamed_variant(
+                "Utility",
+                [Value::unnamed_variant("force_batch", [Value::unnamed_composite(calls)])],
+            );
+            let proxy_args = vec![
+                // real: MultiAddress::Id(account)
+                Value::unnamed_variant("Id", [Value::from_bytes(real.0)]),
+                // force_proxy_type: Option<ProxyType> = Some(Any)
+                Value::unnamed_variant("Some", [Value::unnamed_variant("Any", [])]),
+                // call: RuntimeCall
+                batch_call,
+            ];
+            subxt::dynamic::tx("Proxy", "proxy", proxy_args)
+        }
+    }
+}
+
+/// A short label for one batch's log line: count plus the first username.
+fn batch_label(chunk: &[&ReservationInputs]) -> String {
+    match chunk.first() {
+        Some(first) => format!(
+            "{} name(s) ({}…)",
+            chunk.len(),
+            String::from_utf8_lossy(&first.lite_label)
+        ),
+        None => "0 names".to_string(),
+    }
 }
 
 /// Drain the status stream and return the finalized status. A best-block
