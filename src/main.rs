@@ -194,11 +194,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let asset_hub_connected = *state.asset_hub_connected.read().await;
     let reserve_failures = state.reserve_failures.load(Ordering::Relaxed);
 
-    // Dynamic status: a hardcoded "ok" while disconnected or failing is useless
-    // to an operator/agent watching the endpoint.
+    // Dynamic status: a hardcoded "ok" while disconnected or repeatedly failing is
+    // useless to an operator/agent watching the endpoint.
     let status = if reserve_failures >= UNHEALTHY_FAILURE_THRESHOLD {
         "unhealthy"
-    } else if !people_connected || !asset_hub_connected || reserve_failures > 0 {
+    } else if !people_connected || !asset_hub_connected {
         "degraded"
     } else {
         "ok"
