@@ -1,177 +1,231 @@
 # flow-funder
 
-A standalone bot that watches the **People chain** for newly-registered lite
-identities and **funds each one** with native tokens on **Asset Hub**.
+`flow-funder` watches finalized People-chain blocks for `PeopleLite::attest` calls and reserves each attested username as a dotns name on Asset Hub.
 
-It reuses the storage-diff technique from `mission-control`'s `flow-people`
-worker (subscribe to blocks → `archive_v1_storageDiff` over a storage prefix →
-decode the changes) and the chain-submission technique from its `flow-attester`
-worker (a custom subxt `Config` pinned to the chain's transaction extensions,
-with nonce caching + retry).
+The bot is designed to run continuously. It persists a cursor after fully handling a People-chain block, so it can resume after restarts without missing registrations.
 
-## What it does
+## What It Does
 
+```text
+People chain                                      Asset Hub
+------------                                      ---------
+finalized block N
+      |
+      | decode PeopleLite::attest calls
+      | including calls nested in Utility batches
+      v
+username + signed ownership proof
+      |
+      | check DotnsGateway::LiteLabelOwner
+      v
+already reserved? ---- yes ---> skip
+      |
+      no
+      v
+DotnsGateway::reserve_name
+batched with Utility.force_batch
 ```
-People chain                                   Asset Hub
-────────────                                   ─────────
-finalized block N ──┐
-                    │ archive_v1_storageDiff over PeopleLite::LitePeople
-                    │ (block N vs block N-1)
-                    ▼
-        new "added" entries ──► AccountIds ──► state_queryStorageAt (batched balances)
-                                                 │
-                                    keep those with free < target
-                                       │
-                                       ▼
-                 Utility.batch_all([ transfer_keep_alive(acct, target - free), … ])
-                              (chunked by --batch-size, one tx per chunk)
-```
 
-1. **Detect.** Subscribe to finalized People-chain blocks. For each block, run
-   `archive_v1_storageDiff` over the `PeopleLite::LitePeople` map prefix against
-   the previous block. Every key that is **added** is a newly-registered lite
-   identity; the AccountId is the last 32 bytes of the storage key.
-2. **Check (idempotent, batched).** Read all the block's accounts' free balances
-   on Asset Hub in one `state_queryStorageAt` per `READ_CHUNK` accounts. The
-   People-chain and Asset Hub share the same `AccountId32`, so no address
-   translation is needed.
-3. **Fund (batched).** Take the accounts still below target and submit them as
-   `Utility.batch_all` extrinsics of `transfer_keep_alive(dest, target - free)`,
-   chunked into `--batch-size` calls per tx, each waiting for finalized inclusion
-   with bounded retry on transient pool rejections. So a block with hundreds of
-   registrations (e.g. a catch-up after downtime) becomes a handful of txs, not
-   one per account.
+The bot uses the candidate signature and proof of ownership already present in the People-chain attest call. Asset Hub transactions are signed by the configured reserving key, optionally wrapped through `Proxy.proxy` when `RESERVER_PROXY_FOR` is set (this must match the identity backend configuration).
 
-The balance check is what makes the bot **idempotent**: an account already at or
-above the target is skipped, so re-observing it or restarting the bot never
-double-funds. There is **no genesis bootstrap** — on first boot the watcher
-starts from the current finalized head, so it funds only registrations that
-happen while it runs, never retroactively funding every account already on chain.
+## Reliability
 
-## Reliability — what happens when a connection is lost
-
-Funding is **synchronous per block** and gated by a **persisted cursor** (the
-hash of the last block whose registrations were all handled, written atomically
-to `--cursor-file`). A block's cursor advances only once every account in it has
-been funded, skipped, or — in dry-run — observed. From that one rule:
+The cursor file stores the hash of the last fully handled People-chain block. The cursor only advances after every reservation in the scanned window has been reserved or skipped.
 
 | Failure | Behaviour |
 | --- | --- |
-| **People chain WS drops** | The cycle errors; the outer loop reconnects with exponential backoff (1s→60s) and **resumes the storageDiff from the persisted cursor**, so every registration in the downtime window is still diffed and funded. No gap. |
-| **Asset Hub WS drops mid-fund** | The `batch_all` fails → the block is **not** marked handled → the **cursor stays pinned**. `batch_all` is atomic (no partial chunk), so the funder reconnects and the block is re-diffed on the next tick (and on any restart); the batched balance read skips accounts already funded by earlier chunks and re-batches the rest. No account is silently dropped. |
-| **Transient `storageDiff` failure** | The block is skipped without advancing the cursor, so the next diff re-covers the range. A mid-diff drop (stream ends before the `storageDiffDone` terminator) is treated as an error — a truncated account list is never mistaken for a complete one. |
-| **Silent WS (open but no messages)** | Both the block subscription and each `storageDiff` message are bounded by a 120s timeout; a stall surfaces as an error and triggers reconnect, rather than hanging the loop. |
-| **Stuck / never-included tx** | The finalization wait is bounded (120s); a timeout is retriable, so the loop re-submits instead of hanging forever with `/health` still reporting ok. |
-| **Transient tx-pool rejection** (stale nonce, dropped/usurped) | Retried in-place up to `--max-submit-retries`, refetching the nonce each attempt. |
-| **Process crash / restart** | Resumes from the persisted cursor. The cursor only ever points at a fully-handled block, so nothing between it and the tip is lost. |
-| **Ctrl-C** | Graceful: the current block's in-flight funding finishes, then the loop stops before the next block. A second Ctrl-C force-quits. |
+| People RPC disconnects | Reconnects with exponential backoff and resumes from the persisted cursor. |
+| Asset Hub RPC disconnects | Reconnects and retries the unhandled window. Already-reserved names are skipped. |
+| Reservation tx fails | Cursor stays pinned; the same window is retried. |
+| Process crashes | Restart resumes from the persisted cursor. |
+| Dry run | Detects and logs registrations, but does not submit transactions or persist cursor progress. |
+| No cursor on first boot | Starts at finalized head by default, or at block 0 with `--start-from-genesis`. |
 
-Trade-off: a **permanently** unfundable account (e.g. the funding key is out of
-balance) pins the cursor and keeps retrying every block — by design, it fails
-loudly (`fund_failures` climbs, the cursor stops advancing) rather than silently
-skipping. Top the key up and it drains on the next tick. A dry run loads the
-cursor but never writes one, so it can't advance a real cursor past accounts it
-didn't fund.
-
-## Run
-
-```bash
-# Build
-cargo build --release
-
-# Dry run — detect + log, never submit (recommended first):
-cargo run --release --bin flow-funder -- --dry-run
-
-# Live, with an explicit funding key and target balance:
-FUNDER_SEED_PHRASE="…twelve words…" \
-FUNDER_DERIVATION_PATH=//funder \
-FUNDER_AMOUNT_PLANCK=10000000000 \
-cargo run --release --bin flow-funder
-```
-
-All flags have `--long` and env-var forms — see `.env.example` or `--help`.
-Defaults target **Paseo people-next** and **Paseo Asset Hub next**. Live
-runs require `FUNDER_SEED_PHRASE`; dry runs may use the dev `//Alice` key.
-
-A health endpoint is served at `GET http://127.0.0.1:3033/health`:
-
-```json
-{
-  "status": "ok",            // "degraded" if disconnected or any fund_failures;
-                             // "unhealthy" past the failure threshold
-  "people_connected": true,
-  "asset_hub_connected": true,
-  "last_block_at": 1781530676,
-  "cursor_block_hash": null,
-  "funding_key_balance": 63443372669010,   // refreshed periodically
-  "registrations_seen": 0,
-  "accounts_funded": 0,
-  "accounts_skipped": 0,
-  "fund_failures": 0,
-  "uptime_seconds": 20
-}
-```
-
-`status` is computed, not hardcoded, so an operator/agent can detect a
-disconnect or funding-key exhaustion proactively. `fund_failures` counts fund
-*attempts* that failed (including transient ones the reconnect recovers from),
-not unique accounts.
+During backfill, `RESERVER_SCAN_WINDOW_BLOCKS` controls how many People blocks are decoded before submitting reservations. Sparse registrations across many blocks can share one Asset Hub batch, while the cursor still advances in order.
 
 ## Configuration
 
+All options are available as CLI flags and environment variables.
+
 | Env var | Flag | Default | Meaning |
 | --- | --- | --- | --- |
-| `PEOPLE_NODE_URL` | `--people-url` | `wss://paseo-people-next-system-rpc.polkadot.io` | People chain WS (needs archive RPC) |
-| `ASSET_HUB_NODE_URL` | `--asset-hub-url` | `wss://paseo-asset-hub-next-rpc.polkadot.io` | Asset Hub WS |
-| `FUNDER_SEED_PHRASE` | `--seed-phrase` | required live | Funding account mnemonic |
-| `FUNDER_DERIVATION_PATH` | `--derivation-path` | `//Alice` | Path appended to the seed |
-| `FUNDER_AMOUNT_PLANCK` | `--amount` | `10000000000` (1 PAS) | Target free balance per account, in plancks |
-| `FUNDER_MAX_AMOUNT_PLANCK` | `--max-amount` | `1000000000000000` (100k PAS) | Startup fat-finger ceiling for `--amount` |
-| `FUNDER_MAX_SUBMIT_RETRIES` | `--max-submit-retries` | `3` | Retries on transient pool errors |
-| `FUNDER_BATCH_SIZE` | `--batch-size` | `100` | Max `transfer_keep_alive` calls per `batch_all` tx |
-| `FUNDER_CURSOR_FILE` | `--cursor-file` | `flow-funder-cursor.txt` | Resume cursor (last fully-handled block) |
-| `FUNDER_DRY_RUN` | `--dry-run` | `false` | Detect/log only, never submit or persist |
-| `FUNDER_HEALTH_PORT` | `--health-port` | `3033` | Health server port |
-| `FUNDER_HEALTH_BIND` | `--health-bind` | `127.0.0.1` | Health bind address (`0.0.0.0` to expose off-host) |
+| `PEOPLE_NODE_URL` | `--people-url` | `wss://paseo-people-next-system-rpc.polkadot.io` | People-chain websocket endpoint. Archive mode/backfill requires archive RPC support. |
+| `ASSET_HUB_NODE_URL` | `--asset-hub-url` | `wss://paseo-asset-hub-next-rpc.polkadot.io` | Asset Hub websocket endpoint. |
+| `RESERVER_SEED_PHRASE` | `--seed-phrase` | required live | Sr25519 mnemonic for the reserving signer (MUST have allowance). |
+| `RESERVER_SECRET_KEY` | `--secret-key` | unset | Raw 32-byte sr25519 secret key hex. Takes precedence over seed phrase. |
+| `RESERVER_DERIVATION_PATH` | `--derivation-path` | unset | Derivation path appended to `RESERVER_SEED_PHRASE`. |
+| `RESERVER_PROXY_FOR` | `--proxy-for` | unset | SS58 account that holds dotns allowance when the signer is a proxy delegate. |
+| `RESERVER_BATCH_SIZE` | `--batch-size` | `3` | Max `reserve_name` calls per Asset Hub batch. Batches larger than this are prone to fail. |
+| `RESERVER_MAX_SUBMIT_RETRIES` | `--max-submit-retries` | `3` | Retries for transient submit/finalization failures. |
+| `RESERVER_SCAN_WINDOW_BLOCKS` | `--scan-window-blocks` | `500` | Max People blocks to scan before submitting a batch. |
+| `RESERVER_CURSOR_FILE` | `--cursor-file` | `flow-reserver-cursor.txt` | Cursor file path. Persist this in production. |
+| `RESERVER_START_FROM_GENESIS` | `--start-from-genesis` | `false` | On first boot with no cursor, backfill from block 0. Existing cursor wins. |
+| `RESERVER_DRY_RUN` | `--dry-run` | `false` | Log registrations without submitting or advancing cursor. |
+| `RESERVER_HEALTH_PORT` | `--health-port` | `3033` | Health HTTP port. |
+| `RESERVER_HEALTH_BIND` | `--health-bind` | `127.0.0.1` | Health bind address. Use `0.0.0.0` inside containers. |
+| `RUST_LOG` | n/a | `flow_funder=info` | Tracing filter. |
 
-## Layout
+Use `.env.example` as the template for local env files. Do not commit real mnemonics, secret keys, or proxy addresses.
+
+## Local Run
+
+Build and test:
+
+```bash
+cargo build --release
+cargo test
+```
+
+Run a dry run from the current finalized head:
+
+```bash
+set -a
+source .env.next
+set +a
+
+RESERVER_DRY_RUN=true cargo run --release --bin flow-funder
+```
+
+Run live in archive mode from a fresh cursor:
+
+```bash
+mkdir -p logs
+
+set -a
+source .env.next
+set +a
+
+timeout 5h ./target/release/flow-funder \
+  --start-from-genesis \
+  --cursor-file logs/next-genesis-backfill-cursor.txt \
+  --health-port 3033 \
+  >> logs/next-run.log 2>&1 &
+
+echo $! > logs/next-run.pid
+```
+
+Resume using an existing cursor:
+
+```bash
+timeout 5h ./target/release/flow-funder \
+  --start-from-genesis \
+  --cursor-file logs/next-genesis-backfill-cursor-20260616-195714.txt \
+  --health-port 3033 \
+  >> logs/next-run.log 2>&1 &
+
+echo $! > logs/next-run.pid
+```
+
+`--start-from-genesis` is safe with an existing cursor: the cursor takes precedence. It only matters on first boot when the cursor file does not exist.
+
+Stop the local run:
+
+```bash
+kill "$(cat logs/next-run.pid)"
+```
+
+## Health And Monitoring
+
+The bot serves:
+
+```bash
+curl -fsS http://127.0.0.1:3033/health
+```
+
+Example response:
+
+```json
+{
+  "status": "ok",
+  "people_connected": true,
+  "asset_hub_connected": true,
+  "last_block_at": 1781688789,
+  "cursor_block_hash": "0x754bdcbf562491ae3400a95b8e07076f1c3a35c89bd7a49435385370904b72a5",
+  "registrations_seen": 0,
+  "names_reserved": 0,
+  "names_skipped": 0,
+  "reserve_failures": 0,
+  "uptime_seconds": 13
+}
+```
+
+Status meanings:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | Both RPC connections are up and repeated reservation failures are below threshold. |
+| `degraded` | People RPC or Asset Hub RPC is disconnected. |
+| `unhealthy` | Reservation failures reached the unhealthy threshold. |
+| curl fails | Process crashed, health server is unavailable, or the port is wrong. |
+
+Useful checks:
+
+```bash
+tail -f logs/next-run.log
+curl -fsS http://127.0.0.1:3033/health
+ps -ef | rg 'flow-funder|target/release/flow-funder|timeout 5h'
+```
+
+## Docker
+
+Build the local image:
+
+```bash
+docker build -t flow-funder:test .
+```
+
+Run the bot in Docker with a persisted cursor:
+
+```bash
+docker rm -f flow-funder-next 2>/dev/null || true
+
+set -a
+source .env.next
+set +a
+
+docker run -d \
+  --name flow-funder-next \
+  --restart unless-stopped \
+  --env-file .env.next \
+  -e RESERVER_HEALTH_BIND=0.0.0.0 \
+  -v "$PWD/logs:/data" \
+  -p 3033:3033 \
+  flow-funder:test \
+  --start-from-genesis \
+  --cursor-file /data/next-genesis-backfill-cursor-20260616-195714.txt
+```
+
+Monitor Docker:
+
+```bash
+docker ps --filter name=flow-funder-next
+docker logs -f flow-funder-next
+curl -fsS http://127.0.0.1:3033/health
+docker inspect flow-funder-next --format 'status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}}'
+```
+
+The Dockerfile includes a healthcheck that calls `/health` and requires `"status":"ok"`. `docker ps` will show `(healthy)` or `(unhealthy)`.
+
+Note: Docker `--env-file` keeps quote characters literally. Prefer unquoted values in Docker env files, especially for `RESERVER_PROXY_FOR`. If a local env file must keep quotes, source it in the shell and override the quoted variables with `-e NAME="$NAME"`.
+
+## Repo Layout
 
 | File | Responsibility |
 | --- | --- |
-| `src/registration.rs` | Pure core — storage-key derivation (`twox_128`, `System.Account` key via `Blake2_128Concat`), account extraction from the key tail, `AccountInfo` free-balance decode, and the shortfall-to-target decision. Fully unit-tested. |
-| `src/people.rs` | People-chain helpers — `archive_v1_storageDiff` over the LitePeople prefix (returns the added accounts) and the finalized-head lookup. |
-| `src/asset_hub.rs` | Asset Hub side — custom `AssetHubConfig` (transaction extensions pinned to live metadata), batched balance reads (`state_queryStorageAt`), and chunked `Utility.batch_all` submission. |
-| `src/cursor.rs` | Persisted resume cursor — atomic file-backed `H256` store + hash parser. Unit-tested. |
-| `src/main.rs` | CLI, health endpoint, and the per-block watch→fund→advance-cursor loop with reconnect/backoff. |
-| `src/bin/dump_extensions.rs` | Dev helper. Prints a chain's transaction-extension order + each extension's `extra` shape, so `AssetHubConfig` is pinned to verified metadata rather than guessed. |
+| `src/attest.rs` | Decodes `PeopleLite::attest` calls and extracts reservation data. |
+| `src/asset_hub.rs` | Builds and submits dotns reservation batches on Asset Hub. |
+| `src/chain.rs` | Chain helpers, including finalized-head lookup. |
+| `src/cursor.rs` | Atomic file-backed cursor store. |
+| `src/main.rs` | CLI, health endpoint, reconnect loop, block windowing, and cursor advancement. |
+| `src/registration.rs` | dotns storage-key helpers and idempotency checks. |
+| `src/bin/dump_extensions.rs` | Developer helper for inspecting runtime transaction extensions. |
 
-### Re-pinning the Asset Hub config
+## Re-Pinning Asset Hub Transaction Extensions
 
-`AssetHubConfig` in `src/asset_hub.rs` declares the chain's transaction
-extensions **by name, in on-wire order** — subxt matches them against metadata,
-so the set must be exact. If the runtime upgrades and the extension set changes,
-re-derive it:
+`AssetHubConfig` in `src/asset_hub.rs` is pinned to the chain transaction extensions. If a runtime upgrade changes extension metadata, re-check it:
 
 ```bash
 cargo run --bin dump-extensions -- wss://paseo-asset-hub-next-rpc.polkadot.io
 ```
 
-and update the `TransactionExtensions` tuple, the `build_params` tuple, and the
-per-extension encoding (`define_simple_extension!` = single `0x00` byte for
-`Option`-`None` / `bool`-`false`; `define_empty_extension!` = no bytes).
-
-## Notes
-
-- The People chain and Asset Hub use the same `AccountId32`; the bot funds the
-  exact account observed on the People chain.
-- Funding uses `transfer_keep_alive` so a transfer can never reap (delete) the
-  destination by leaving it below the existential deposit.
-- Funding is batched: a block's needing-funding accounts go out as chunked
-  `Utility.batch_all` extrinsics (`--batch-size` calls each), and their balances
-  are read in batched `state_queryStorageAt` calls — so a large catch-up costs a
-  few txs and a few reads, not one of each per account.
-- Tested end-to-end against live Paseo in dry-run: detection of real
-  registrations, the batched balance reads, and `batch_all` call encoding against
-  live metadata are verified (a 585-account catch-up planned into 6 `batch_all`
-  txs); the actual submission path is intentionally exercised only with a funded
-  key.
+Then update the extension tuple and encoding in `src/asset_hub.rs`.
