@@ -23,11 +23,11 @@ use subxt::tx::{TransactionInBlock, TransactionProgress, TransactionStatus};
 use subxt::utils::AccountId32;
 use subxt::OnlineClient;
 use subxt_rpcs::{rpc_params, RpcClient};
-use subxt_signer::sr25519::Keypair;
 use tracing::{info, warn};
 
 use crate::attest::ReservationInputs;
 use crate::registration::lite_label_owner_key;
+use crate::signer::ReserverSigner;
 
 /// Max time to wait for a submitted tx to finalize before treating the attempt
 /// as failed (retriable). ~5× a generous block time — a tx stuck in the pool
@@ -281,7 +281,7 @@ pub struct Reserver {
     api: OnlineClient<AssetHubConfig>,
     /// Raw RPC over the same connection as `api`, for `state_queryStorageAt`.
     rpc: RpcClient,
-    signer: Keypair,
+    signer: ReserverSigner,
     signer_account: AccountId32,
     /// When set, submit reservations wrapped in `Proxy.proxy(real = this, …)` —
     /// for when the `AttestationAllowance` is held by this real account and the
@@ -297,14 +297,14 @@ pub struct Reserver {
 impl Reserver {
     pub async fn connect(
         url: &str,
-        signer: Keypair,
+        signer: ReserverSigner,
         proxy_for: Option<AccountId32>,
         batch_size: usize,
         max_retries: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let rpc = RpcClient::from_url(url).await?;
         let api = OnlineClient::<AssetHubConfig>::from_rpc_client(rpc.clone()).await?;
-        let signer_account = AccountId32(signer.public_key().0);
+        let signer_account = signer.account();
         Ok(Self {
             api,
             rpc,

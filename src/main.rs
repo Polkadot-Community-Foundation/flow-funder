@@ -32,6 +32,7 @@ mod attest;
 mod chain;
 mod cursor;
 mod registration;
+mod signer;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -608,16 +609,29 @@ async fn handle_window(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_signer(cli: &Cli) -> Result<Keypair, Box<dyn std::error::Error>> {
-    // A raw 32-byte secret key (identity-backend's format) takes precedence.
+fn build_signer(cli: &Cli) -> Result<signer::ReserverSigner, Box<dyn std::error::Error>> {
+    // A raw secret key takes precedence. Two accepted forms for the same account:
+    //   * 32-byte sr25519 mini-secret (seed), or
+    //   * 64-byte Ed25519-expanded secret key — identity-backend's
+    //     ATTESTER_PROXY_PRIVATE_KEY (polkadot-js / PAPI sr25519 private key).
     if let Some(hex_key) = cli.secret_key.as_deref() {
         let bytes = hex::decode(hex_key.trim().strip_prefix("0x").unwrap_or(hex_key.trim()))
             .map_err(|e| format!("invalid --secret-key hex: {e}"))?;
-        let secret: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "--secret-key must be 32 bytes (sr25519 mini-secret)")?;
-        return Keypair::from_secret_key(secret)
-            .map_err(|e| format!("invalid --secret-key: {e}").into());
+        return match bytes.len() {
+            32 => {
+                let secret: [u8; 32] = bytes.try_into().expect("checked len == 32");
+                Ok(signer::ReserverSigner::from_subxt(
+                    Keypair::from_secret_key(secret)
+                        .map_err(|e| format!("invalid 32-byte --secret-key: {e}"))?,
+                ))
+            }
+            64 => signer::ReserverSigner::from_ed25519_expanded(&bytes).map_err(Into::into),
+            n => Err(format!(
+                "--secret-key must be a 32-byte sr25519 mini-secret or a 64-byte \
+                 Ed25519-expanded secret key (hex); got {n} bytes"
+            )
+            .into()),
+        };
     }
 
     let seed_phrase = match cli.seed_phrase.as_deref() {
@@ -646,7 +660,7 @@ fn build_signer(cli: &Cli) -> Result<Keypair, Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("invalid secret URI: {e}"))?;
     let keypair = Keypair::from_uri(&uri).map_err(|e| format!("invalid seed phrase: {e}"))?;
-    Ok(keypair)
+    Ok(signer::ReserverSigner::from_subxt(keypair))
 }
 
 fn unix_timestamp_now() -> u64 {
@@ -702,6 +716,20 @@ mod tests {
         let mut cli = cli_for_signer(false, None);
         cli.secret_key = Some("0x1234".to_string());
         let err = build_signer(&cli).unwrap_err().to_string();
-        assert!(err.contains("32 bytes"));
+        assert!(err.contains("got 2 bytes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn build_signer_accepts_64_byte_expanded_secret_key() {
+        // 64-byte Ed25519-expanded secret of the all-7s mini-secret.
+        use schnorrkel::{ExpansionMode, MiniSecretKey};
+        let expanded = MiniSecretKey::from_bytes(&[7u8; 32])
+            .unwrap()
+            .expand_to_keypair(ExpansionMode::Ed25519)
+            .secret
+            .to_ed25519_bytes();
+        let mut cli = cli_for_signer(false, None);
+        cli.secret_key = Some(format!("0x{}", hex::encode(expanded)));
+        assert!(build_signer(&cli).is_ok());
     }
 }

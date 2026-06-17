@@ -998,6 +998,7 @@ dependencies = [
  "hex",
  "parity-scale-codec",
  "scale-info",
+ "schnorrkel",
  "serde",
  "serde_json",
  "subxt",
