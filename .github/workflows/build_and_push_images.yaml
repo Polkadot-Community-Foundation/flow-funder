@@ -1,0 +1,27 @@
+name: Build and Push Images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build-manifest:
+    uses: paritytech/ci-actions/.github/workflows/build-manifest.yaml@main
+    with:
+      runs-on: parity-default
+      push: ${{ github.event_name == 'push' }}
+      environment: ${{ github.event_name == 'push' && 'docker-publish' || null }}
+    secrets:
+      GCP_SA_GITHUB: ${{ secrets.GCP_SA_GITHUB }}
+      GCP_WIP_GITHUB: ${{ secrets.GCP_WIP_GITHUB }}

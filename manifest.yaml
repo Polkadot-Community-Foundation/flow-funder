@@ -1,0 +1,8 @@
+registry: europe-docker.pkg.dev/parity-mgmt/flow-funder
+
+images:
+  bot:
+    dockerfile: Dockerfile
+    context: .
+    port: 3033
+    ingressRoute: /

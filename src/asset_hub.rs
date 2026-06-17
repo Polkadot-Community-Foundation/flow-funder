@@ -392,7 +392,11 @@ impl Reserver {
             reserved += chunk.len();
             tx_hashes.push(tx_hash);
         }
-        Ok(BlockReserveOutcome { reserved, skipped, tx_hashes })
+        Ok(BlockReserveOutcome {
+            reserved,
+            skipped,
+            tx_hashes,
+        })
     }
 
     /// Dry-run: count names that would be reserved (skipping already-reserved
@@ -409,7 +413,11 @@ impl Reserver {
             let payload = build_batch_payload(chunk, self.proxy_for.as_ref());
             encoded_bytes += tx_client.call_data(&payload)?.len();
         }
-        Ok(DryRunReport { would_reserve: to_reserve.len(), skipped, encoded_bytes })
+        Ok(DryRunReport {
+            would_reserve: to_reserve.len(),
+            skipped,
+            encoded_bytes,
+        })
     }
 
     /// Split inputs into those not yet reserved (to submit) and a count of those
@@ -490,7 +498,10 @@ impl Reserver {
             },
         };
 
-        info!(label, attempt, nonce, "submitting DotnsGateway.reserve_name");
+        info!(
+            label,
+            attempt, nonce, "submitting DotnsGateway.reserve_name"
+        );
 
         let progress = match tx_client
             .sign_and_submit_then_watch(payload, &self.signer, build_params(nonce))
@@ -574,7 +585,10 @@ fn build_reserve_name_call(input: &ReservationInputs) -> Value {
         reserved_base_label,                  // reserved_base_label: Option<BaseLabel>
     ];
 
-    Value::unnamed_variant("DotnsGateway", [Value::unnamed_variant("reserve_name", args)])
+    Value::unnamed_variant(
+        "DotnsGateway",
+        [Value::unnamed_variant("reserve_name", args)],
+    )
 }
 
 /// Build a `Utility.force_batch([reserve_name, …])` payload for one chunk of
@@ -591,14 +605,19 @@ fn build_batch_payload(
 
     match proxy_for {
         // Direct: the signer holds the gateway AttestationAllowance.
-        None => {
-            subxt::dynamic::tx("Utility", "force_batch", vec![Value::unnamed_composite(calls)])
-        }
+        None => subxt::dynamic::tx(
+            "Utility",
+            "force_batch",
+            vec![Value::unnamed_composite(calls)],
+        ),
         // Proxied: Proxy.proxy(real, Some(ProxyType::Any), Utility.force_batch([…])).
         Some(real) => {
             let batch_call = Value::unnamed_variant(
                 "Utility",
-                [Value::unnamed_variant("force_batch", [Value::unnamed_composite(calls)])],
+                [Value::unnamed_variant(
+                    "force_batch",
+                    [Value::unnamed_composite(calls)],
+                )],
             );
             let proxy_args = vec![
                 // real: MultiAddress::Id(account)
@@ -663,7 +682,9 @@ const RETRIABLE_SUBSTRINGS: &[&str] = &[
 
 fn is_retriable(err: &str) -> bool {
     let lower = err.to_lowercase();
-    RETRIABLE_SUBSTRINGS.iter().any(|needle| lower.contains(needle))
+    RETRIABLE_SUBSTRINGS
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 /// Exponential backoff with a cap: `base × 2^min(attempt, shift_cap)`, ceilinged.
@@ -698,7 +719,12 @@ mod tests {
 
     #[test]
     fn is_retriable_rejects_fatal_errors() {
-        for s in ["on-chain: FundsUnavailable", "BadOrigin", "metadata mismatch", ""] {
+        for s in [
+            "on-chain: FundsUnavailable",
+            "BadOrigin",
+            "metadata mismatch",
+            "",
+        ] {
             assert!(!is_retriable(s), "{s:?} should be fatal");
         }
     }

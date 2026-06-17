@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+logs
+target
+*.log
+*.pid
+*.tmp
+next-run.log.copy
+README.md

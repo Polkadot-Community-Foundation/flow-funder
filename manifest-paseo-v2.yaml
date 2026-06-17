@@ -1,0 +1,16 @@
+images:
+  bot:
+    env:
+      PEOPLE_NODE_URL: wss://paseo-people-next-system-rpc.polkadot.io
+      ASSET_HUB_NODE_URL: wss://paseo-asset-hub-next-rpc.polkadot.io
+      RESERVER_PROXY_FOR: ref+vault://kv/argo-cd/flow-funder/devops-parity-paseo-v2#reserver-proxy-for
+      RESERVER_SEED_PHRASE: ref+vault://kv/argo-cd/flow-funder/devops-parity-paseo-v2#reserver-seed-phrase
+      RESERVER_DERIVATION_PATH: ref+vault://kv/argo-cd/flow-funder/devops-parity-paseo-v2#reserver-derivation-path
+      RESERVER_BATCH_SIZE: "5"
+      RESERVER_MAX_SUBMIT_RETRIES: "3"
+      RESERVER_SCAN_WINDOW_BLOCKS: "500"
+      RESERVER_CURSOR_FILE: /data/flow-funder-cursor.txt
+      RESERVER_DRY_RUN: "false"
+      RESERVER_HEALTH_PORT: "3033"
+      RESERVER_HEALTH_BIND: 0.0.0.0
+      RUST_LOG: flow_funder=info

@@ -23,8 +23,9 @@
 //!   * a reservation failure leaves the cursor pinned, so the block is re-decoded
 //!     and the failed name retried, while already-reserved names are skipped.
 //!
-//! On first boot (no cursor) the watcher starts from the current finalized head,
-//! so existing registrations are never retroactively reserved.
+//! On first boot (no cursor) the watcher starts from the current finalized head
+//! unless `--start-from-genesis` is set, in which case it walks from block 0 up
+//! to the streamed finalized head.
 
 mod asset_hub;
 mod attest;
@@ -39,7 +40,6 @@ use std::time::Duration;
 use axum::{extract::State, Json, Router};
 use clap::Parser;
 use serde::Serialize;
-use subxt::client::OnlineClientAtBlock;
 use subxt::config::{Header, SubstrateConfig};
 use subxt::utils::{AccountId32, H256};
 use subxt::OnlineClient;
@@ -110,6 +110,12 @@ struct Cli {
     #[arg(long, env = "RESERVER_MAX_SUBMIT_RETRIES", default_value = "3")]
     max_submit_retries: u32,
 
+    /// Max People-chain blocks to decode ahead before submitting reservations.
+    /// During backfill this lets sparse registrations from multiple blocks share
+    /// one Asset Hub batch, while the persisted cursor still advances in order.
+    #[arg(long, env = "RESERVER_SCAN_WINDOW_BLOCKS", default_value = "500")]
+    scan_window_blocks: u64,
+
     /// File holding the resume cursor (last fully-handled People block hash).
     #[arg(
         long,
@@ -117,6 +123,12 @@ struct Cli {
         default_value = "flow-reserver-cursor.txt"
     )]
     cursor_file: String,
+
+    /// On first boot (no cursor file), process from People-chain block 0 instead
+    /// of starting at the current finalized head. Existing cursors still win; use
+    /// a fresh cursor file to intentionally backfill from genesis.
+    #[arg(long, env = "RESERVER_START_FROM_GENESIS", default_value = "false")]
+    start_from_genesis: bool,
 
     /// Detect and log registrations but never submit a `reserve_name` (or persist
     /// a cursor — a dry run must not advance a real cursor).
@@ -235,11 +247,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind the health endpoint in `main` so a bind failure fails startup loudly,
     // instead of a `.expect` panic silently killing a spawned task.
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.health_bind, cli.health_port))
-        .await
-        .map_err(|e| {
-            format!("failed to bind health endpoint on {}:{}: {e}", cli.health_bind, cli.health_port)
-        })?;
+    let listener =
+        tokio::net::TcpListener::bind(format!("{}:{}", cli.health_bind, cli.health_port))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to bind health endpoint on {}:{}: {e}",
+                    cli.health_bind, cli.health_port
+                )
+            })?;
     info!(bind = %cli.health_bind, port = cli.health_port, "health endpoint listening");
     {
         let health_state = state.clone();
@@ -337,12 +353,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Whether a processed block's cursor may advance, or must stay pinned for retry.
-enum ProcessOutcome {
-    Advance,
-    Pin,
-}
-
 /// One People-chain connection cycle: connect, resolve the starting block from
 /// the persisted cursor (or the finalized head on first boot), then process every
 /// finalized block up to the streamed head until the subscription ends, the
@@ -359,13 +369,20 @@ async fn run_people_cycle(
     let api = OnlineClient::<SubstrateConfig>::from_rpc_client(rpc.clone()).await?;
     *state.people_connected.write().await = true;
 
-    // Resolve the last fully-handled block; only first boot starts at the tip.
+    // Resolve the last fully-handled block. By default first boot starts at the
+    // tip; explicit backfill mode starts from genesis when no cursor exists.
     let mut last_number = match cursor_store.load().await? {
         Some(hash) => {
             let number = api.at_block(hash).await?.block_header().await?.number();
             info!(cursor = %format_args!("{hash:?}"), number, "resuming from persisted cursor");
             *state.cursor_block_hash.write().await = Some(format!("{hash:?}"));
             number
+        }
+        None if cli.start_from_genesis => {
+            let genesis = api.at_block(0u64).await?;
+            let hash = genesis.block_hash();
+            info!(genesis = %format_args!("{hash:?}"), "first boot with --start-from-genesis — starting from block 0");
+            0
         }
         None => {
             let head = finalized_head(&rpc).await?;
@@ -395,106 +412,156 @@ async fn run_people_cycle(
         let target = block.number();
         *state.last_block_at.write().await = Some(unix_timestamp_now());
 
-        // Process every finalized block in (last_number, target], one at a time,
-        // advancing the cursor per block. This fills any gap the finalized stream
-        // skipped or a reconnect left behind — preserving the no-missed guarantee.
+        // Decode a bounded window of finalized People blocks ahead of the cursor,
+        // then reserve all names from that window together. This preserves ordered
+        // cursor advancement while allowing sparse backfill registrations from
+        // multiple People blocks to share Asset Hub transactions.
         while last_number < target {
             if shutdown.load(Ordering::SeqCst) {
                 info!("stopping People cycle for shutdown");
                 return Ok(());
             }
-            let number = last_number + 1;
-            let at = api.at_block(number).await?;
-            let block_hash = at.block_hash();
 
-            match process_block(cli, reserver, state, number, block_hash, &at).await {
-                ProcessOutcome::Advance => {
-                    last_number = number;
+            let queued = match collect_block_window(&api, state, last_number, target, cli).await {
+                Ok(queued) => queued,
+                Err(e) => {
+                    warn!(
+                        next_block = last_number + 1,
+                        error = %e,
+                        "decoding attests failed — leaving cursor pinned"
+                    );
+                    break;
+                }
+            };
+
+            if queued.is_empty() {
+                break;
+            }
+
+            if shutdown.load(Ordering::SeqCst) {
+                info!("stopping People cycle for shutdown");
+                return Ok(());
+            }
+
+            if handle_window(reserver, &queued, cli, state).await {
+                for block in queued {
+                    last_number = block.number;
                     // Persist the cursor, unless this is a dry run (a dry run must
                     // not advance a real cursor past unreserved names).
                     if !cli.dry_run {
-                        cursor_store.save(block_hash).await?;
-                        *state.cursor_block_hash.write().await = Some(format!("{block_hash:?}"));
+                        cursor_store.save(block.hash).await?;
+                        *state.cursor_block_hash.write().await = Some(format!("{:?}", block.hash));
                     }
                 }
-                ProcessOutcome::Pin => {
-                    // Leave last_number unchanged so this block is retried when the
-                    // next block streams in; reserved names are skipped on retry.
-                    break;
-                }
+            } else {
+                warn!(
+                    first_block = queued.first().map(|b| b.number),
+                    last_block = queued.last().map(|b| b.number),
+                    "window has unreserved names — cursor pinned; window will be retried (reserved names are skipped)"
+                );
+                break;
             }
         }
     }
 }
 
-/// Decode one block's attests, log its registrations, and reserve them. Returns
-/// whether the cursor may advance.
-async fn process_block(
-    cli: &Cli,
-    reserver: &mut Reserver,
-    state: &AppState,
-    block_number: u64,
-    block_hash: H256,
-    at: &OnlineClientAtBlock<SubstrateConfig>,
-) -> ProcessOutcome {
-    let inputs = match reservations_in_block(at).await {
-        Ok(inputs) => inputs,
-        Err(e) => {
-            warn!(block = block_number, error = %e, "decoding attests failed — leaving cursor pinned");
-            return ProcessOutcome::Pin;
-        }
-    };
-
-    for input in &inputs {
-        state.registrations_seen.fetch_add(1, Ordering::Relaxed);
-        info!(
-            username = %String::from_utf8_lossy(&input.lite_label),
-            block = block_number,
-            block_hash = %format_args!("{block_hash:?}"),
-            "username registered on People chain"
-        );
-    }
-
-    if inputs.is_empty() {
-        return ProcessOutcome::Advance;
-    }
-
-    if handle_block(reserver, &inputs, block_number, cli, state).await {
-        ProcessOutcome::Advance
-    } else {
-        warn!(
-            block = block_number,
-            "block has unreserved names — cursor pinned; block will be retried (reserved names are skipped)"
-        );
-        ProcessOutcome::Pin
-    }
+struct QueuedBlock {
+    number: u64,
+    hash: H256,
+    inputs: Vec<attest::ReservationInputs>,
 }
 
-/// Reserve all of a block's names in one pass. Returns `true` if the block was
-/// fully handled (reserved/skipped, or — in dry-run — planned), `false` if a
-/// reservation failed (so the caller pins the cursor and retries later).
-async fn handle_block(
+/// Decode a bounded range of People blocks ahead of the cursor. The window stops
+/// once it has enough names to fill at least one Asset Hub batch, or once the
+/// configured scan window / streamed target is reached. Empty blocks are queued
+/// too, so their cursors can advance after the combined reservation succeeds.
+async fn collect_block_window(
+    api: &OnlineClient<SubstrateConfig>,
+    state: &AppState,
+    last_number: u64,
+    target: u64,
+    cli: &Cli,
+) -> Result<Vec<QueuedBlock>, Box<dyn std::error::Error + Send + Sync>> {
+    let scan_limit = cli.scan_window_blocks.max(1);
+    let name_limit = cli.batch_size.max(1);
+    let mut queued = Vec::new();
+    let mut queued_names = 0usize;
+
+    while last_number + (queued.len() as u64) < target
+        && (queued.len() as u64) < scan_limit
+        && queued_names < name_limit
+    {
+        let number = last_number + queued.len() as u64 + 1;
+        let at = api.at_block(number).await?;
+        let hash = at.block_hash();
+        let inputs = reservations_in_block(&at).await?;
+
+        for input in &inputs {
+            state.registrations_seen.fetch_add(1, Ordering::Relaxed);
+            info!(
+                username = %String::from_utf8_lossy(&input.lite_label),
+                block = number,
+                block_hash = %format_args!("{hash:?}"),
+                "username registered on People chain"
+            );
+        }
+
+        queued_names += inputs.len();
+        queued.push(QueuedBlock {
+            number,
+            hash,
+            inputs,
+        });
+    }
+
+    Ok(queued)
+}
+
+/// Reserve all names in a decoded window. Returns `true` if the whole window was
+/// handled and its cursors may advance, or `false` if the first cursor must stay
+/// pinned for retry.
+async fn handle_window(
     reserver: &mut Reserver,
-    inputs: &[attest::ReservationInputs],
-    block_number: u64,
+    queued: &[QueuedBlock],
     cli: &Cli,
     state: &AppState,
 ) -> bool {
+    let first_block = queued.first().map(|b| b.number).unwrap_or_default();
+    let last_block = queued.last().map(|b| b.number).unwrap_or_default();
+    let blocks = queued.len();
+    let inputs: Vec<_> = queued
+        .iter()
+        .flat_map(|block| block.inputs.iter().cloned())
+        .collect();
+
+    if inputs.is_empty() {
+        return true;
+    }
+
     if cli.dry_run {
-        match reserver.dry_run_block(inputs).await {
+        match reserver.dry_run_block(&inputs).await {
             Ok(report) => info!(
-                block = block_number,
+                first_block,
+                last_block,
+                blocks,
+                registrations = inputs.len(),
                 would_reserve = report.would_reserve,
                 skipped = report.skipped,
                 encoded_bytes = report.encoded_bytes,
                 "dry-run — reserve_name encodes against live metadata; not submitting"
             ),
-            Err(e) => warn!(block = block_number, error = %e, "dry-run reservation planning failed"),
+            Err(e) => warn!(
+                first_block,
+                last_block,
+                blocks,
+                error = %e,
+                "dry-run reservation planning failed"
+            ),
         }
         return true;
     }
 
-    match reserver.reserve_block(inputs).await {
+    match reserver.reserve_block(&inputs).await {
         Ok(outcome) => {
             *state.asset_hub_connected.write().await = true;
             state
@@ -504,22 +571,32 @@ async fn handle_block(
                 .names_skipped
                 .fetch_add(outcome.skipped as u64, Ordering::Relaxed);
             info!(
-                block = block_number,
+                first_block,
+                last_block,
+                blocks,
+                registrations = inputs.len(),
                 reserved = outcome.reserved,
                 skipped = outcome.skipped,
                 tx_hashes = ?outcome.tx_hashes,
-                "block reserved"
+                "window reserved"
             );
             true
         }
         Err(e) => {
             state.reserve_failures.fetch_add(1, Ordering::Relaxed);
-            error!(block = block_number, error = %e, "reservation failed — attempting Asset Hub reconnect");
+            error!(
+                first_block,
+                last_block,
+                blocks,
+                registrations = inputs.len(),
+                error = %e,
+                "reservation failed — attempting Asset Hub reconnect"
+            );
             match reserver.reconnect(&cli.asset_hub_url).await {
                 Ok(()) => *state.asset_hub_connected.write().await = true,
                 Err(re) => {
                     *state.asset_hub_connected.write().await = false;
-                    error!(error = %re, "Asset Hub reconnect failed; will retry when the block is reprocessed");
+                    error!(error = %re, "Asset Hub reconnect failed; will retry when the window is reprocessed");
                 }
             }
             false
@@ -593,7 +670,9 @@ mod tests {
             proxy_for: None,
             batch_size: 50,
             max_submit_retries: 3,
+            scan_window_blocks: 500,
             cursor_file: "cursor.txt".to_string(),
+            start_from_genesis: false,
             dry_run,
             health_port: 3033,
             health_bind: "127.0.0.1".to_string(),

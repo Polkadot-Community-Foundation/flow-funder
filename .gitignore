@@ -1,1 +1,6 @@
 /target
+.env.next
+.env.preview
+.env.summit
+next-run.log.copy
+logs
