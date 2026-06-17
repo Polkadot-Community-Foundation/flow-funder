@@ -1,4 +1,4 @@
-registry: europe-docker.pkg.dev/parity-mgmt/flow-funder
+registry: ghcr.io/<org-or-user>/flow-funder
 
 images:
   bot:
