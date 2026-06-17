@@ -6,9 +6,9 @@ images:
     env:
       PEOPLE_NODE_URL: wss://summit-people-rpc.polkadot.io
       ASSET_HUB_NODE_URL: wss://summit-asset-hub-rpc.polkadot.io
-      RESERVER_PROXY_FOR: ref+vault://kv/argo-cd/products/flow-funder#reserver-proxy-for
-      RESERVER_SEED_PHRASE: ref+vault://kv/argo-cd/products/flow-funder#reserver-seed-phrase
-      RESERVER_DERIVATION_PATH: ref+vault://kv/argo-cd/products/flow-funder#reserver-derivation-path
+      RESERVER_PROXY_FOR: ref+vault://kv/argo-cd/flow-funder/flow-funder#reserver-proxy-for
+      RESERVER_SEED_PHRASE: ref+vault://kv/argo-cd/flow-funder/flow-funder#reserver-seed-phrase
+      RESERVER_DERIVATION_PATH: ref+vault://kv/argo-cd/flow-funder/flow-funder#reserver-derivation-path
       RESERVER_BATCH_SIZE: "5"
       RESERVER_MAX_SUBMIT_RETRIES: "3"
       RESERVER_SCAN_WINDOW_BLOCKS: "500"
