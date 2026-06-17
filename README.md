@@ -28,6 +28,27 @@ batched with Utility.force_batch
 
 The bot uses the candidate signature and proof of ownership already present in the People-chain attest call. Asset Hub transactions are signed by the configured reserving key, optionally wrapped through `Proxy.proxy` when `RESERVER_PROXY_FOR` is set (this must match the identity backend configuration).
 
+## Asset Hub runtime prerequisite (READ FIRST)
+
+`flow-funder` reserves names by **replaying the People-chain `attest` signature** into
+`DotnsGateway::reserve_name` on Asset Hub. That only works on the **`w3s-dotnsgateway-workaround`**
+variant of the dotns-gateway pallet, whose 7-arg `reserve_name` verifies the *same* message as
+`attest` (so the on-chain attest signature is reusable).
+
+The **standard** dotns-gateway pallet has a 6-arg `reserve_name(candidate, candidate_signature,
+lite_label, chat_key, reserved_base_label, signed_at)` that verifies the candidate's signature over a
+SCALE tuple binding the **attester** and a fresh **`signed_at`**. That signature is produced
+client-side at registration and is **never present in the People `attest` extrinsic** — so a
+chain-watcher like `flow-funder` cannot produce it. Against the standard pallet the bot connects but
+**every reservation fails**.
+
+> **Therefore: the target Asset Hub must run the workaround pallet.** As verified against
+> `wss://summit-asset-hub-rpc.polkadot.io`, Summit Asset Hub currently runs the **standard** 6-arg
+> pallet. `flow-funder` is ready for Summit (network, extensions, image, CI) but will not reserve
+> until Summit Asset Hub is upgraded to the workaround `reserve_name`. This is a runtime change owned
+> by the individuality/platform team, not a change in this repo. (The transaction-extension set is
+> already byte-identical between Summit and the workaround chain, so no other retarget is needed.)
+
 ## Reliability
 
 The cursor file stores the hash of the last fully handled People-chain block. The cursor only advances after every reservation in the scanned window has been reserved or skipped.
@@ -49,8 +70,8 @@ All options are available as CLI flags and environment variables.
 
 | Env var | Flag | Default | Meaning |
 | --- | --- | --- | --- |
-| `PEOPLE_NODE_URL` | `--people-url` | `wss://paseo-people-next-system-rpc.polkadot.io` | People-chain websocket endpoint. Archive mode/backfill requires archive RPC support. |
-| `ASSET_HUB_NODE_URL` | `--asset-hub-url` | `wss://paseo-asset-hub-next-rpc.polkadot.io` | Asset Hub websocket endpoint. |
+| `PEOPLE_NODE_URL` | `--people-url` | `wss://summit-people-rpc.polkadot.io` | People-chain websocket endpoint. Archive mode/backfill requires archive RPC support. |
+| `ASSET_HUB_NODE_URL` | `--asset-hub-url` | `wss://summit-asset-hub-rpc.polkadot.io` | Asset Hub websocket endpoint (must run the workaround dotns-gateway pallet — see prerequisite). |
 | `RESERVER_SEED_PHRASE` | `--seed-phrase` | required live | Sr25519 mnemonic for the reserving signer (MUST have allowance). |
 | `RESERVER_SECRET_KEY` | `--secret-key` | unset | Raw 32-byte sr25519 secret key hex. Takes precedence over seed phrase. |
 | `RESERVER_DERIVATION_PATH` | `--derivation-path` | unset | Derivation path appended to `RESERVER_SEED_PHRASE`. |
@@ -249,7 +270,7 @@ Note: Docker `--env-file` keeps quote characters literally. Prefer unquoted valu
 `AssetHubConfig` in `src/asset_hub.rs` is pinned to the chain transaction extensions. If a runtime upgrade changes extension metadata, re-check it:
 
 ```bash
-cargo run --bin dump-extensions -- wss://paseo-asset-hub-next-rpc.polkadot.io
+cargo run --bin dump-extensions -- wss://summit-asset-hub-rpc.polkadot.io
 ```
 
 Then update the extension tuple and encoding in `src/asset_hub.rs`.

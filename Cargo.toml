@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 # Dev helper: dumps a chain's transaction-extension order so AssetHubConfig can
 # be pinned to live metadata instead of guessed. Run:
-#   cargo run --bin dump-extensions -- wss://paseo-asset-hub-next-rpc.polkadot.io
+#   cargo run --bin dump-extensions -- wss://summit-asset-hub-rpc.polkadot.io
 [[bin]]
 name = "dump-extensions"
 path = "src/bin/dump_extensions.rs"

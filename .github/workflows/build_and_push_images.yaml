@@ -2,14 +2,14 @@ name: Build and Push Image
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
-  packages: write
+  id-token: write # required for Workload Identity Federation (GAR auth)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,7 +17,9 @@ concurrency:
 
 env:
   IMAGE_NAME: flow-funder
-  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  # Private Google Artifact Registry — pcf-infra (ArgoCD) pulls from here. The GAR
+  # repo + WIF binding are provisioned in pcf-infra terraform/flow-funder-artifact-registry.tf.
+  GAR_REGISTRY: us-docker.pkg.dev/polkadot-community-foundation/flow-funder
 
 jobs:
   build:
@@ -29,13 +31,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to registry
+      - name: Compute image tag (date-shortsha)
+        id: ver
+        run: echo "version=$(date -u '+%Y%m%d-%H%M%S')-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # GAR auth via Workload Identity Federation. Only on push (PRs just build, no
+      # push, so they need no GCP credentials). Repo secrets GCP_SA_GITHUB /
+      # GCP_WIP_GITHUB come from the terraform outputs (see pcf-infra).
+      - name: Set up gcloud
         if: github.event_name == 'push'
-        uses: docker/login-action@v3
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Authenticate to Google Artifact Registry
+        if: github.event_name == 'push'
+        uses: google-github-actions/auth@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          service_account: ${{ secrets.GCP_SA_GITHUB }}
+          workload_identity_provider: ${{ secrets.GCP_WIP_GITHUB }}
+
+      - name: Configure Docker for GAR
+        if: github.event_name == 'push'
+        run: gcloud auth configure-docker us-docker.pkg.dev --quiet
 
       - name: Build and optionally push
         uses: docker/build-push-action@v6
@@ -44,5 +60,5 @@ jobs:
           file: Dockerfile
           push: ${{ github.event_name == 'push' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ${{ env.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
