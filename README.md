@@ -67,6 +67,23 @@ All options are available as CLI flags and environment variables.
 
 Use `.env.example` as the template for local env files. Do not commit real mnemonics, secret keys, or proxy addresses.
 
+## Prerequisites
+
+Anyone can run the bot in dry-run mode with only network access to the configured
+People-chain and Asset Hub websocket endpoints.
+
+Live reservation requires:
+
+- A reserving sr25519 signer, provided as `RESERVER_SEED_PHRASE` plus optional
+  `RESERVER_DERIVATION_PATH`, or as `RESERVER_SECRET_KEY`.
+- Dotns reservation allowance on Asset Hub for that signer, or a proxy setup
+  where `RESERVER_PROXY_FOR` is the allowance-holding account and the signer is
+  its proxy delegate.
+- A funded signer/proxy account for transaction fees.
+- A persisted cursor file path for long-running or production deployments.
+- An archive People-chain endpoint when running historical backfill from genesis
+  or an old cursor.
+
 ## Local Run
 
 Build and test:
@@ -74,6 +91,13 @@ Build and test:
 ```bash
 cargo build --release
 cargo test
+```
+
+Create a local env file:
+
+```bash
+cp .env.example .env.next
+$EDITOR .env.next
 ```
 
 Run a dry run from the current finalized head:
