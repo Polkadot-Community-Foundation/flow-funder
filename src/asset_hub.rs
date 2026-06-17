@@ -1,6 +1,6 @@
 //! Asset Hub dotns-reservation side.
 //!
-//! Holds a custom subxt `Config` pinned to Paseo Asset Hub Next's live
+//! Holds a custom subxt `Config` pinned to Summit Asset Hub's live
 //! transaction-extension set (verified with the `dump-extensions` bin — see the
 //! `AssetHubConfig` comment), the `DotnsGateway::LiteLabelOwner` idempotency read,
 //! and the `DotnsGateway::reserve_name` submission with nonce caching + retry. The
@@ -129,10 +129,11 @@ macro_rules! define_empty_extension {
     };
 }
 
-// Paseo Asset Hub Next custom extensions. VERIFIED against live metadata
-// (`dump-extensions wss://paseo-asset-hub-next-rpc.polkadot.io`): each `As*` /
+// Summit Asset Hub custom extensions. VERIFIED against live metadata
+// (`dump-extensions wss://summit-asset-hub-rpc.polkadot.io`): each `As*` /
 // `AuthorizeValueTransfer` is `struct{ Option<…> }` → None = 0x00; RestrictOrigins
-// is `struct{ bool }` → false = 0x00.
+// is `struct{ bool }` → false = 0x00. (Summit's 17-extension set is byte-identical
+// in name+order to paseo-asset-hub-next's, so this pin carried over unchanged.)
 define_simple_extension!(AuthorizeValueTransfer, "AuthorizeValueTransfer", 0x00);
 define_simple_extension!(AsPgas, "AsPgas", 0x00);
 define_simple_extension!(AsRingAlias, "AsRingAlias", 0x00);
@@ -150,7 +151,7 @@ define_empty_extension!(StorageWeightReclaim, "StorageWeightReclaim");
 // Asset Hub config
 // ---------------------------------------------------------------------------
 
-/// Config for Paseo Asset Hub Next.
+/// Config for Summit Asset Hub.
 #[derive(Debug, Clone)]
 pub struct AssetHubConfig(SubstrateConfig);
 
@@ -167,7 +168,7 @@ impl Config for AssetHubConfig {
     type Hasher = <SubstrateConfig as Config>::Hasher;
     type Header = <SubstrateConfig as Config>::Header;
     type AssetId = <SubstrateConfig as Config>::AssetId;
-    // VERIFIED against live paseo-asset-hub-next metadata: the runtime's 17
+    // VERIFIED against live summit-asset-hub-rpc metadata: the runtime's 17
     // transaction extensions, in on-wire order. subxt matches each by NAME, so
     // the set must be complete and ordered.
     type TransactionExtensions = (
@@ -559,10 +560,17 @@ fn classify_submit_err(message: String) -> AttemptOutcome {
 /// NOTE: this 7-arg shape matches the individuality `w3s-dotnsgateway-workaround`
 /// branch (commit "[W3S only] … same signature as in people-lite pallet"), which
 /// makes `reserve_name` verify the same message as `attest` so the attest
-/// signatures are reusable. The pre-workaround pallet currently deployed on
-/// paseo-asset-hub-next has a different 6-arg shape (no ring_vrf_key/proof, plus a
-/// `signed_at: u64`); encoding will fail there until the chain runs the workaround
-/// runtime. The bot is intentionally built for the workaround pallet.
+/// signatures are reusable — the ONLY configuration in which a People-chain watcher
+/// can reserve without re-collecting a fresh per-name signature.
+///
+/// ⚠️ Asset Hub runtime prerequisite (see README): Summit Asset Hub must run this
+/// workaround pallet. The STANDARD pallet — currently live on summit-asset-hub-rpc
+/// (verified) — has a different 6-arg shape (`…, lite_label, chat_key,
+/// reserved_base_label, signed_at`; no ring_vrf_key/proof) and verifies the
+/// candidate's signature over a SCALE tuple binding the attester + `signed_at`. That
+/// signature is NOT present in the People `attest` extrinsic, so the bot cannot
+/// produce it; encoding (and, were it to encode, on-chain verification) fails against
+/// the standard pallet. The bot is intentionally built for the workaround pallet.
 ///
 /// The first four args are passed through verbatim as the decoded `Value`s — they
 /// re-encode structurally against Asset Hub's metadata (same runtime types). The

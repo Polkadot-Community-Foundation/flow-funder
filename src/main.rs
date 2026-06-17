@@ -65,7 +65,7 @@ struct Cli {
     #[arg(
         long,
         env = "PEOPLE_NODE_URL",
-        default_value = "wss://paseo-people-next-system-rpc.polkadot.io"
+        default_value = "wss://summit-people-rpc.polkadot.io"
     )]
     people_url: String,
 
@@ -73,7 +73,7 @@ struct Cli {
     #[arg(
         long,
         env = "ASSET_HUB_NODE_URL",
-        default_value = "wss://paseo-asset-hub-next-rpc.polkadot.io"
+        default_value = "wss://summit-asset-hub-rpc.polkadot.io"
     )]
     asset_hub_url: String,
 

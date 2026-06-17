@@ -1,4 +1,4 @@
-registry: ghcr.io/<org-or-user>/flow-funder
+registry: ghcr.io/polkadot-community-foundation/flow-funder
 
 images:
   bot:

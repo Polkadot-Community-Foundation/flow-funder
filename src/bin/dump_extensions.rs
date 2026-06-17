@@ -7,7 +7,7 @@
 //! pin both the ordered set AND each extension's "disabled/none" encoding. This
 //! dumps both from live metadata so the config is verified, not guessed.
 //!
-//!   cargo run --bin dump-extensions -- wss://paseo-asset-hub-next-rpc.polkadot.io
+//!   cargo run --bin dump-extensions -- wss://summit-asset-hub-rpc.polkadot.io
 
 use scale_info::{PortableRegistry, TypeDef};
 use subxt::{OnlineClient, PolkadotConfig};
@@ -65,7 +65,7 @@ fn describe_type(registry: &PortableRegistry, id: u32) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "wss://paseo-asset-hub-next-rpc.polkadot.io".to_string());
+        .unwrap_or_else(|| "wss://summit-asset-hub-rpc.polkadot.io".to_string());
 
     eprintln!("connecting to {url} …");
     let api = OnlineClient::<PolkadotConfig>::from_url(&url).await?;
